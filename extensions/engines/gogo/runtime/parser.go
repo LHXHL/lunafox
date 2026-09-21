@@ -227,6 +227,11 @@ func parseGogoOutput(ctx context.Context, artifact io.Reader, results enginecont
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			return abort(summary, fmt.Errorf("decode gogo record %d: %w", summary.Records+1, err))
 		}
+		// The jl file opens (and may close) with a parameter-echo line that
+		// carries no port; only port-bearing lines are scan results.
+		if strings.TrimSpace(record.Port) == "" {
+			continue
+		}
 		summary.Records++
 		outcome, err := ParseGogoRecord(record)
 		if err != nil {

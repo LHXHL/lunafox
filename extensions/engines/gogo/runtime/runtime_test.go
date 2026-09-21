@@ -1,6 +1,8 @@
 package gogoruntime
 
 import (
+	"context"
+	"strings"
 	"encoding/json"
 	"testing"
 
@@ -138,6 +140,70 @@ func TestParseGogoRecordRejectsBadPort(t *testing.T) {
 	if _, err := ParseGogoRecord(gogoRecord{Port: "80"}); err == nil {
 		t.Fatal("expected error for missing ip")
 	}
+}
+
+func TestGogoOutputSkipsParameterEchoLines(t *testing.T) {
+	echo := `{"ip":"192.168.163.10","ips":null,"ports":"top2","threads":600,"mod":"default","json_type":"scan"}`
+	result := `{"ip":"192.168.163.10","port":"80","protocol":"http","status":"200","uri":"/","title":"Welcome to nginx!","frameworks":{"nginx":{"name":"nginx"}}}`
+	hostPorts := &recordingHostPorts{}
+	websites := &recordingWebsites{}
+	technologies := &recordingTechnologies{}
+	vulnerabilities := &recordingVulnerabilities{}
+	summary, err := parseGogoOutput(
+		context.Background(),
+		strings.NewReader(echo+"\n"+result+"\n"),
+		enginecontract.Results{
+			HostPorts:           hostPorts,
+			Websites:            websites,
+			WebsiteTechnologies: technologies,
+			Vulnerabilities:     vulnerabilities,
+		},
+	)
+	if err != nil {
+		t.Fatalf("parseGogoOutput: %v", err)
+	}
+	if summary.Records != 1 || summary.HostPorts != 1 || summary.Websites != 1 || summary.Technologies != 1 {
+		t.Errorf("summary = %+v, want records/hostPorts/websites/technologies = 1", summary)
+	}
+	if len(websites.items) != 1 || websites.items[0].Title != "Welcome to nginx!" {
+		t.Errorf("websites = %+v", websites.items)
+	}
+}
+
+type recordingHostPorts struct{ items []enginecontract.HostPort }
+
+func (recorder *recordingHostPorts) Submit(_ context.Context, items <-chan enginecontract.HostPort) error {
+	for item := range items {
+		recorder.items = append(recorder.items, item)
+	}
+	return nil
+}
+
+type recordingWebsites struct{ items []enginecontract.Website }
+
+func (recorder *recordingWebsites) Submit(_ context.Context, items <-chan enginecontract.Website) error {
+	for item := range items {
+		recorder.items = append(recorder.items, item)
+	}
+	return nil
+}
+
+type recordingTechnologies struct{ items []enginecontract.WebsiteTechnology }
+
+func (recorder *recordingTechnologies) Submit(_ context.Context, items <-chan enginecontract.WebsiteTechnology) error {
+	for item := range items {
+		recorder.items = append(recorder.items, item)
+	}
+	return nil
+}
+
+type recordingVulnerabilities struct{ items []enginecontract.Vulnerability }
+
+func (recorder *recordingVulnerabilities) Submit(_ context.Context, items <-chan enginecontract.Vulnerability) error {
+	for item := range items {
+		recorder.items = append(recorder.items, item)
+	}
+	return nil
 }
 
 func joinArgs(args []string) string {

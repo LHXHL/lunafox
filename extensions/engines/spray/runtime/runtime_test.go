@@ -1,6 +1,7 @@
 package sprayruntime
 
 import (
+	"encoding/json"
 	"testing"
 
 	enginecontract "github.com/yyhuni/lunafox/engines/spray/contract"
@@ -119,4 +120,24 @@ func indexOf(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+func TestParseSprayRealWorldRecord(t *testing.T) {
+	// Fixture captured from spray v0.3.2 file-output json against a live
+	// nginx target; extracts is an array of extractor objects.
+	line := `{"number":0,"parent":0,"valid":true,"fuzzy":false,"url":"http://192.168.163.10/","path":"/","host":"","body_length":896,"header_length":238,"status":200,"spend":2,"content_type":"html","title":"Welcome to nginx!","frameworks":{"nginx":{"name":"nginx","froms":{"6":true},"tags":["fingers"],"attributes":{"part":"a"}}},"extracts":[{"name":"linkfinder","severity":"info","extract_result":["\"https://nginx.org/\""]}],"error":"","reason":"","source":3,"From":0,"depth":0,"distance":0,"unique":53755,"hashes":{"body-md5":"6bb03ae5bc151ad04e3875dc8992e270"}}`
+	var record sprayRecord
+	if err := json.Unmarshal([]byte(line), &record); err != nil {
+		t.Fatalf("unmarshal real record: %v", err)
+	}
+	directories, technologies, err := ParseSprayRecord(record)
+	if err != nil {
+		t.Fatalf("ParseSprayRecord: %v", err)
+	}
+	if len(directories) != 1 || directories[0].Status != 200 || directories[0].ContentLength != 896 {
+		t.Errorf("directories = %+v", directories)
+	}
+	if len(technologies) != 1 || technologies[0].Tech[0] != "nginx" {
+		t.Errorf("technologies = %+v", technologies)
+	}
 }

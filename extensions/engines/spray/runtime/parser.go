@@ -29,8 +29,10 @@ type sprayRecord struct {
 	Frameworks  map[string]struct {
 		Name string `json:"name"`
 	} `json:"frameworks"`
-	Extracteds map[string][]string `json:"extracts"`
-	ErrString  string             `json:"error"`
+	// extracts is an array of extractor objects whose shape is tool-owned;
+	// the engine does not map it to canonical results, so it stays raw.
+	Extracteds json.RawMessage `json:"extracts"`
+	ErrString  string          `json:"error"`
 }
 
 // ParseSprayRecord converts one decoded spray record into canonical typed

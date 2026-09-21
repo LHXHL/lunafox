@@ -179,18 +179,70 @@ gogo 单阶段吃掉官方 ports+websites 两阶段；zombie 默认关闭（侵�
 | GPL-3.0 | wrapper 同 GPL；自用无义务，对外分发需开源 wrapper |
 | 爆破类能力合规 | zombie Profile 默认关闭；仅用于授权目标 |
 
-## 8. 验证结果（Tier 1 已完成）
+## 8. 验证结果
+
+### Tier 1（本地，已完成）
 
 | 门 | 结果 |
 |---|---|
 | 三引擎 `go build ./...` + `go vet ./...` | ✅ 通过 |
-| 三引擎单元测试（命令构造 + 解析映射 + 目标过滤，表驱动） | ✅ 全绿（测试曾捕获非 HTTP 兜底 URL 缺 `//` 的真实 bug 并已修复） |
+| 三引擎单元测试（命令构造 + 解析映射 + 目标过滤，表驱动） | ✅ 全绿 |
 | engine.json 严格解码（复用平台 `contracts/enginemanifest.DecodeRootManifest`） | ✅ 三个清单全部通过 |
 | 工作流 JSON 严格校验（复用 `contracts/scanworkflow.DecodeDefinition + ValidateDefinition`） | ✅ default + chainreactors 均通过 |
-| Docker 镜像构建（工具下载 SHA256 校验 → 容器内编译 → conformance 门） | ✅ 三镜像全部通过（gogo 151MB / spray 197MB / zombie 180MB） |
+| Docker 镜像构建（工具下载 SHA256 校验 → 容器内编译 → conformance 门） | ✅ 三镜像全部通过 |
 | 镜像内真实工具运行（gogo -P port / spray --help / zombie -l） | ✅ 全部正常输出 |
 
-Tier 2（部署环境）待执行：dev compose 安装链打包 `.lfengine.tar.gz`、生产 UI 安装、端到端扫描入库——见第 5 节步骤 6。
+### Tier 2（本地完整部署，已完成）
+
+在本地以开发模式跑通了完整生产链路：本地 OCI registry（HTTP:5500，macOS 的 5000 被 AirPlay 占用）
+→ 三引擎 runtime image（arm64，Docker manifest 经 registry API 转换为符合验证器要求的
+单平台 OCI index）→ `.lfengine.tar.gz`（平台 `enginepackagebuild` 生成）→ `engine-oci-publish`
+发布为 OCI artifact → compose 引导安装（`ENGINE_INSTALL_DEVELOPMENT_MODE=true`，bootstrap 补丁
+脚本跳过与开发模式互斥的 `ENGINE_INSTALL_REGISTRY` 断言）→ API 注册可见 → 工作流加载 →
+对 nginx 测试目标（192.168.163.10）端到端扫描。
+
+**端到端结果（scan 5，status=succeeded，8 秒）**：
+
+| 任务 | 引擎 | 结果 |
+|---|---|---|
+| recon | gogo | `records=1 hostPorts=1 websites=1 technologies=1`（nginx/80 指纹命中） |
+| content | spray | 消费 gogo 产出的 WebsiteURLs 事实 → `directories=1 technologies=1` |
+| credential | zombie | 消费 HostPorts 事实 → `targets=0 skippedPorts=1`（80 端口无服务映射，按设计优雅跳过） |
+
+数据库证据：`website` 表 `http://192.168.163.10:80/ | Welcome to nginx!`；`host_port_mapping`
+表 `192.168.163.10:80`；`directory` 表 `url=/ status=200 content_length=896`。
+
+### Tier 2 过程中发现并修复的问题
+
+1. **gogo jl 输出首行是参数回显**（无 port 字段）→ 解析器跳过无 port 行（真实容器执行中发现）。
+2. **spray 的 `extracts` 字段是数组而非对象** → 解析器改用 `json.RawMessage`（真实输出夹具入测试）。
+3. **生成适配器吞掉引擎错误**（只打印固定失败消息）→ 三个引擎 main.go 增加错误透传到 stderr。
+4. **工作流 ID 不允许连字符**（`^[a-z][a-z0-9_]{0,63}$`）→ dev 工作流命名 `chainreactors_dev`。
+5. **quickCreate 的 wordlist 参数必须用资源名**（`wordlists/1`），profile 草稿返回的文件名
+   `dir_default.txt` 不能直接提交。
+
+### 重要平台事实修正（生产部署须知）
+
+**生产模式（`ENGINE_INSTALL_DEVELOPMENT_MODE` 未开启）下，`POST /v1/engines:install`
+对每个非 CF 候选强制执行 Sigstore keyless 验签**（`infra.go` 始终构造
+`NewProductionSigstoreKeylessVerifier`，验证目标为 `yyhuni/lunafox` 仓库的 GitHub OIDC 身份；
+无签名 referrer 时返回 `MissingBundleError` 并 fail-closed）。因此：
+
+- 第三方引擎包在生产模式下**无法通过 operator API 安装**（此前基于 README 网页摘要的
+  "签名不决定准入"结论仅适用于模块契约层，实际生产装配层强制验签）。
+- 自托管第三方引擎的现实路径：`ENGINE_INSTALL_DEVELOPMENT_MODE=true`（需同时启用
+  plain HTTP 本地 registry 与单平台镜像，bootstrap inventory 安装），或 fork server
+  放宽验签器装配。
+- operator API 路径即使开发模式也要求匿名 HTTPS registry + 双架构 index（`infra.go`
+  未把 dev 策略接到 operator puller）；本地第三方安装走 bootstrap inventory 路径。
+
+### 生产部署清单（后续真实上线时）
+
+1. 双架构镜像（`docker buildx build --platform linux/amd64,linux/arm64`）
+2. 发布到匿名可拉的 HTTPS registry（如 ghcr.io）
+3. 若保持平台生产模式：需 fork server 移除/放宽 `infra.go` 的验签器装配（GPL 允许）
+4. `extensions/workflows/chainreactors.scan-workflow.json` 需在官方 8 引擎已安装的环境使用
+   （其引用了官方 subdomain_discovery/url_collection/screenshot/nuclei 引擎）
 
 ## 9. 回滚
 
