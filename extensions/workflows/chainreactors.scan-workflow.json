@@ -1,0 +1,72 @@
+{
+  "scanWorkflowId": "chainreactors",
+  "displayName": "ChainReactors Scan",
+  "description": "Attack surface workflow built on chainreactors engines: subdomain discovery, gogo recon (ports, websites, fingerprints, POCs), URL collection, spray directory fuzzing, screenshots, optional nuclei and zombie credential audit.",
+  "stages": [
+    {
+      "stageId": "discovery",
+      "steps": [
+        {
+          "stepId": "subdomain_discovery",
+          "engineId": "engine.lunafox.subdomain_discovery",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "recon",
+      "steps": [
+        {
+          "stepId": "gogo",
+          "engineId": "engine.lhxhl.gogo",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "content",
+      "steps": [
+        {
+          "stepId": "url_collection",
+          "engineId": "engine.lunafox.url_collection",
+          "profileDefaultEnabled": true
+        },
+        {
+          "stepId": "spray",
+          "engineId": "engine.lhxhl.spray",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "screenshot",
+      "steps": [
+        {
+          "stepId": "screenshot",
+          "engineId": "engine.lunafox.screenshot",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "nuclei",
+      "steps": [
+        {
+          "stepId": "nuclei_vulnerability",
+          "engineId": "engine.lunafox.nuclei_vulnerability",
+          "profileDefaultEnabled": false
+        }
+      ]
+    },
+    {
+      "stageId": "credential",
+      "steps": [
+        {
+          "stepId": "zombie",
+          "engineId": "engine.lhxhl.zombie",
+          "profileDefaultEnabled": false
+        }
+      ]
+    }
+  ]
+}

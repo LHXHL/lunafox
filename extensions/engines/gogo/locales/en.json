@@ -1,0 +1,35 @@
+{
+  "engine": {
+    "displayName": "Gogo Recon",
+    "description": "Port scan, service probe, fingerprint, and POC detection in one gogo run."
+  },
+  "sections": {
+    "gogo": {
+      "name": "Gogo",
+      "description": "Configure the gogo recon run.",
+      "params": {
+        "port-tag": {
+          "description": "Port preset tag passed to gogo -p (top1/top2/top3/common/all...)."
+        },
+        "ports": {
+          "description": "Explicit port expression that overrides port-tag when set."
+        },
+        "concurrency": {
+          "description": "Concurrent thread count passed to gogo -t."
+        },
+        "timeout": {
+          "description": "Socket and HTTP timeout in seconds passed to gogo -d."
+        },
+        "mod": {
+          "description": "gogo smart mode: default, s, ss, or sc."
+        },
+        "exploit": {
+          "description": "Enable gogo neutron POC vulnerability detection."
+        },
+        "active-finger": {
+          "description": "Enable gogo active fingerprint scanning (-v)."
+        }
+      }
+    }
+  }
+}

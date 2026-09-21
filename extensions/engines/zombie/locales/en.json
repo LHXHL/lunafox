@@ -1,0 +1,23 @@
+{
+  "engine": {
+    "displayName": "Zombie Credential Audit",
+    "description": "Weak-credential auditing for discovered services with zombie; findings are reported as critical vulnerabilities."
+  },
+  "sections": {
+    "zombie": {
+      "name": "Zombie",
+      "description": "Configure the zombie credential audit run.",
+      "params": {
+        "services": {
+          "description": "Whitelist of zombie service plugins eligible for auditing."
+        },
+        "weakpass": {
+          "description": "Generate password candidates from weak-password rules (seed required)."
+        },
+        "threads": {
+          "description": "Concurrent thread count passed to zombie --thread."
+        }
+      }
+    }
+  }
+}

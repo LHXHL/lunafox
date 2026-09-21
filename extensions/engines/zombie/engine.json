@@ -1,0 +1,46 @@
+{
+  "manifestVersion": "engine.v5",
+  "engineId": "engine.lhxhl.zombie",
+  "publisher": "lhxhl",
+  "execution": {
+    "engineApiMajor": 2,
+    "supportedTargetTypes": [
+      "ip",
+      "cidr"
+    ],
+    "configSections": [
+      {
+        "id": "zombie",
+        "defaultEnabled": true,
+        "params": [
+          {
+            "key": "services",
+            "type": "stringArray",
+            "default": [
+              "ssh",
+              "mysql",
+              "mssql",
+              "redis",
+              "ftp",
+              "smb",
+              "rdp",
+              "postgre"
+            ]
+          },
+          {
+            "key": "weakpass",
+            "type": "boolean",
+            "default": false
+          },
+          {
+            "key": "threads",
+            "type": "integer",
+            "default": 100,
+            "minimum": 1,
+            "maximum": 500
+          }
+        ]
+      }
+    ]
+  }
+}

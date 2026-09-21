@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "lunafox-engine-image-conformance-profile/v1",
+  "target": {
+    "type": "domain",
+    "value": "example.com"
+  },
+  "noOpEnabledSections": [
+    "spray"
+  ],
+  "toolEnabledSections": [
+    "spray"
+  ],
+  "gateDefaultProgressAck": false,
+  "resultType": "asset.directory.v1",
+  "toolStubs": [],
+  "argvAssertions": [],
+  "platformResources": [],
+  "imageLocalProbes": []
+}

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "lunafox-engine-image-conformance-profile/v1",
+  "target": {
+    "type": "ip",
+    "value": "192.0.2.10"
+  },
+  "noOpEnabledSections": [
+    "zombie"
+  ],
+  "toolEnabledSections": [
+    "zombie"
+  ],
+  "gateDefaultProgressAck": false,
+  "resultType": "asset.vulnerability.v1",
+  "toolStubs": [],
+  "argvAssertions": [],
+  "platformResources": [],
+  "imageLocalProbes": []
+}

@@ -1,0 +1,66 @@
+{
+  "manifestVersion": "engine.v5",
+  "engineId": "engine.lhxhl.gogo",
+  "publisher": "lhxhl",
+  "execution": {
+    "engineApiMajor": 2,
+    "supportedTargetTypes": [
+      "domain",
+      "ip",
+      "cidr"
+    ],
+    "configSections": [
+      {
+        "id": "gogo",
+        "defaultEnabled": true,
+        "params": [
+          {
+            "key": "port-tag",
+            "type": "string",
+            "default": "top2"
+          },
+          {
+            "key": "ports",
+            "type": "string",
+            "default": ""
+          },
+          {
+            "key": "concurrency",
+            "type": "integer",
+            "default": 600,
+            "minimum": 1,
+            "maximum": 4000
+          },
+          {
+            "key": "timeout",
+            "type": "integer",
+            "default": 3,
+            "minimum": 1,
+            "maximum": 30
+          },
+          {
+            "key": "mod",
+            "type": "string",
+            "default": "default",
+            "enum": [
+              "default",
+              "s",
+              "ss",
+              "sc"
+            ]
+          },
+          {
+            "key": "exploit",
+            "type": "boolean",
+            "default": true
+          },
+          {
+            "key": "active-finger",
+            "type": "boolean",
+            "default": false
+          }
+        ]
+      }
+    ]
+  }
+}

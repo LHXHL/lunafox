@@ -1,0 +1,23 @@
+{
+  "engine": {
+    "displayName": "Zombie Credential Audit",
+    "description": "使用 zombie 对已发现服务进行弱口令审计，命中结果按严重漏洞上报。"
+  },
+  "sections": {
+    "zombie": {
+      "name": "Zombie",
+      "description": "配置 zombie 口令审计执行。",
+      "params": {
+        "services": {
+          "description": "允许审计的 zombie 服务插件白名单。"
+        },
+        "weakpass": {
+          "description": "启用弱口令规则生成密码候选（需要种子密码）。"
+        },
+        "threads": {
+          "description": "传递给 zombie --thread 的并发线程数。"
+        }
+      }
+    }
+  }
+}

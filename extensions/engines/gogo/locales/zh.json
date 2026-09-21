@@ -1,0 +1,35 @@
+{
+  "engine": {
+    "displayName": "Gogo Recon",
+    "description": "一次 gogo 执行完成端口扫描、服务探测、指纹识别与 POC 检测。"
+  },
+  "sections": {
+    "gogo": {
+      "name": "Gogo",
+      "description": "配置 gogo 侦察执行。",
+      "params": {
+        "port-tag": {
+          "description": "传递给 gogo -p 的端口预设标签（top1/top2/top3/common/all 等）。"
+        },
+        "ports": {
+          "description": "显式端口表达式，设置后覆盖 port-tag。"
+        },
+        "concurrency": {
+          "description": "传递给 gogo -t 的并发线程数。"
+        },
+        "timeout": {
+          "description": "传递给 gogo -d 的 socket 与 HTTP 超时（秒）。"
+        },
+        "mod": {
+          "description": "gogo 智能模式：default、s、ss 或 sc。"
+        },
+        "exploit": {
+          "description": "启用 gogo neutron POC 漏洞检测。"
+        },
+        "active-finger": {
+          "description": "启用 gogo 主动指纹扫描（-v）。"
+        }
+      }
+    }
+  }
+}

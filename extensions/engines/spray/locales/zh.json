@@ -1,0 +1,29 @@
+{
+  "engine": {
+    "displayName": "Spray Directory Fuzz",
+    "description": "使用 spray 进行目录与路径爆破，含智能过滤与指纹识别。"
+  },
+  "sections": {
+    "spray": {
+      "name": "Spray",
+      "description": "配置 spray 目录爆破执行。",
+      "params": {
+        "wordlist": {
+          "description": "作为 spray 字典的字典资源绑定。"
+        },
+        "pool": {
+          "description": "传递给 spray --pool 的并发池数量。"
+        },
+        "threads": {
+          "description": "传递给 spray --thread 的每池线程数。"
+        },
+        "request-timeout": {
+          "description": "传递给 spray --timeout 的单请求超时（秒）。"
+        },
+        "mod": {
+          "description": "spray 爆破模式：path 或 host。"
+        }
+      }
+    }
+  }
+}

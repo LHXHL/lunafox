@@ -1,0 +1,29 @@
+{
+  "engine": {
+    "displayName": "Spray Directory Fuzz",
+    "description": "Directory and path fuzzing with spray, including smart filtering and fingerprints."
+  },
+  "sections": {
+    "spray": {
+      "name": "Spray",
+      "description": "Configure the spray directory fuzzing run.",
+      "params": {
+        "wordlist": {
+          "description": "Wordlist resource binding used as the spray dictionary."
+        },
+        "pool": {
+          "description": "Concurrent pool count passed to spray --pool."
+        },
+        "threads": {
+          "description": "Threads per pool passed to spray --thread."
+        },
+        "request-timeout": {
+          "description": "Per-request timeout in seconds passed to spray --timeout."
+        },
+        "mod": {
+          "description": "spray fuzz mode: path or host."
+        }
+      }
+    }
+  }
+}
