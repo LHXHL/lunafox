@@ -144,7 +144,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node --test scripts/ci/publish-public-deployment.test.mjs scripts/ci/finalize-engine-runtime-platforms.test.mjs
+          node --test scripts/ci/publish-public-deployment.test.mjs scripts/ci/preheat-manifest.test.mjs scripts/ci/generate-compose-deployment.test.mjs scripts/ci/finalize-engine-runtime-platforms.test.mjs
           if [ -f scripts/ci/component-evidence-bundle-selftest.mjs ]; then
             node scripts/ci/component-evidence-bundle-selftest.mjs
           fi
@@ -595,8 +595,21 @@ jobs:
               echo "previous composition release tag does not match its GitHub Release" >&2
               exit 1
             }
+            [[ "$previous_release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+              echo "previous release tag is invalid: $previous_release_tag" >&2
+              exit 1
+            }
+            git fetch --no-tags --depth=1 origin \
+              "refs/tags/${previous_release_tag}:refs/tags/${previous_release_tag}"
+            git show "${previous_release_tag}:server/cmd/server/migrations/manifest.json" \
+              > dist/public-composition/previous-migration-manifest.json
+            node scripts/ci/resolve-release-migration-metadata.mjs \
+              --current-migration-manifest server/cmd/server/migrations/manifest.json \
+              --previous-migration-manifest dist/public-composition/previous-migration-manifest.json \
+              --output dist/public-composition/previous-migration-resolution.json \
+              --json >/dev/null
           else
-            rm -f dist/public-composition/previous.json dist/public-composition/previous.manifest.yaml dist/public-composition/previous.component-evidence.json dist/public-composition/previous.public-release-provenance.json dist/public-composition/previous-release-verification.json dist/public-composition/previous-release-evidence-verification.json dist/public-composition/previous-composition-verification.json dist/public-composition/previous-component-evidence-verification.json
+            rm -f dist/public-composition/previous.json dist/public-composition/previous.manifest.yaml dist/public-composition/previous.component-evidence.json dist/public-composition/previous.public-release-provenance.json dist/public-composition/previous-release-verification.json dist/public-composition/previous-release-evidence-verification.json dist/public-composition/previous-composition-verification.json dist/public-composition/previous-component-evidence-verification.json dist/public-composition/previous-migration-manifest.json dist/public-composition/previous-migration-resolution.json
             previous_release=""
           fi
           echo "previous_release=$previous_release" >> "$GITHUB_OUTPUT"
@@ -1190,7 +1203,7 @@ jobs:
             --arg binarySignerIdentity "$binary_signer_identity" \
             --arg artifactId "$AGENT_ARTIFACT_ID" \
             --arg inputFingerprint "$AGENT_INPUT_FINGERPRINT" \
-            '{schemaVersion:1,status:"published",component:"agent",sourceRepository:$sourceRepository,destinationRepository:$destinationRepository,sourceRevisionDigest:$sourceRevisionDigest,publicMergeCommit:$publicMergeCommit,releaseTag:$releaseTag,workflowRun:$workflowRun,workflowIdentity:$workflowIdentity,image:$image,dockerHubImage:("docker.io/yyhuni/lunafox-agent@" + $digest),digest:$digest,publicExportManifestSha256:$publicExportManifestSha256,publicProvenanceSha256:$publicProvenanceSha256,dockerfileSha256:$dockerfileSha256,platforms:["linux/amd64","linux/arm64"],sbom:true,provenance:true,attestation:true,attestationSubject:$image,attestationPredicateType:"https://slsa.dev/provenance/v1",binaryArtifactId:$artifactId,binaryInputFingerprint:$inputFingerprint,binaryBundleDigest:$bundleDigest,binarySourceRevisionDigest:$sourceRevisionDigest,binaryExportManifestSha256:$publicExportManifestSha256,binaryProvenanceSha256:$publicProvenanceSha256,binaryTreePath:("agent/bin/" + $artifactId),binaryTreeBaseManifestSha256:$treeManifestDigest,binarySignerIssuer:"https://token.actions.githubusercontent.com",binarySignerIdentity:$binarySignerIdentity,binaryMembers:["lunafox-agent-linux-amd64","lunafox-agent-linux-arm64","lunafox-engine-mount-preflight-linux-amd64","lunafox-engine-mount-preflight-linux-arm64"]}' \
+            '{schemaVersion:1,status:"published",component:"agent",sourceRepository:$sourceRepository,destinationRepository:$destinationRepository,sourceRevisionDigest:$sourceRevisionDigest,publicMergeCommit:$publicMergeCommit,releaseTag:$releaseTag,workflowRun:$workflowRun,workflowIdentity:$workflowIdentity,image:$image,dockerHubImage:("docker.io/yyhuni/lunafox-agent@" + $digest),digest:$digest,publicExportManifestSha256:$publicExportManifestSha256,publicProvenanceSha256:$publicProvenanceSha256,dockerfileSha256:$dockerfileSha256,platforms:["linux/amd64","linux/arm64"],sbom:true,provenance:true,attestation:true,attestationSubject:$image,attestationPredicateType:"https://slsa.dev/provenance/v1",binaryArtifactId:$artifactId,binaryInputFingerprint:$inputFingerprint,binaryBundleDigest:$bundleDigest,binarySourceRevisionDigest:$sourceRevisionDigest,binaryExportManifestSha256:$publicExportManifestSha256,binaryProvenanceSha256:$publicProvenanceSha256,binaryTreePath:("agent/bin/" + $artifactId),binaryTreeBaseManifestSha256:$treeManifestDigest,binarySignerIssuer:"https://token.actions.githubusercontent.com",binarySignerIdentity:$binarySignerIdentity,binaryMembers:["lunafox-agent-linux-amd64","lunafox-agent-linux-arm64","lunafox-engine-mount-preflight-linux-amd64","lunafox-engine-mount-preflight-linux-arm64","lunafox-engine-preheater-linux-amd64","lunafox-engine-preheater-linux-arm64"]}' \
             > dist/public-runtime-image-evidence-agent.json
       - name: Write immutable Agent promotion receipt
         if: steps.composition.outputs.disposition == 'reused'
@@ -2301,6 +2314,21 @@ jobs:
           mkdir -p dist/final
           release_version="${RELEASE_TAG#v}"
           refs_for() { awk -F= '$1 == "DOCKERHUB_REF" {docker=$2} $1 == "GHCR_REF" {ghcr=$2} END {print docker "," ghcr}' "dist/final/runtime-digests/$1.env"; }
+          previous_migration_manifest="dist/final/composition-plan/previous-migration-manifest.json"
+          previous_migration_args=()
+          previous_release="${{ needs.resolve-public-runtime-composition.outputs.previous_release }}"
+          if [ -n "$previous_release" ]; then
+            [ -f "$previous_migration_manifest" ] || {
+              echo "previous release exists but its migration manifest boundary was not carried through the composition artifact" >&2
+              exit 1
+            }
+            previous_migration_args+=(--previous-migration-manifest "$previous_migration_manifest")
+          else
+            [ ! -e "$previous_migration_manifest" ] || {
+              echo "migration boundary artifact exists without a verified previous release" >&2
+              exit 1
+            }
+          fi
           RELEASE_VERSION="$release_version" \
           RUNTIME_SERVER_REFS="$(refs_for server)" \
           RUNTIME_FRONTEND_REFS="$(refs_for frontend)" \
@@ -2310,6 +2338,7 @@ jobs:
           bash scripts/ci/generate-release-manifest.sh \
             --engine-ref-dir dist/final/engine/public-engine-package-digests \
             --release-profile "$RELEASE_PROFILE" \
+            "${previous_migration_args[@]}" \
             --final-runtime-contract --verify-contract \
             --output dist/final/release.manifest.yaml
           node scripts/ci/verify-public-release.mjs \
@@ -2378,6 +2407,8 @@ jobs:
               [ "$actual" = "$expected" ]
               unzip -t "$file" >/dev/null
             done
+          test -f dist/final/deployment-snapshot/preheat-manifest.json
+          test "$(jq -er '.manifestDigest' dist/final/deployment-snapshot/preheat-manifest.json)" = "$(awk -F= '$1 == \"LUNAFOX_PREHEAT_MANIFEST_DIGEST\" {print $2}' dist/final/deployment-snapshot/.env)"
       - id: deployment
         name: Publish and verify the protected deployment snapshot
         env:
@@ -2461,10 +2492,21 @@ jobs:
           fi
           if [ -d "$channel_worktree/channels" ]; then cp -a "$channel_worktree/channels/." "$channel_root/channels/"; fi
           if [ -d "$channel_worktree/manifests" ]; then cp -a "$channel_worktree/manifests/." "$channel_root/manifests/"; fi
+          preheat_args=()
+          deployment_asset_args=()
+          if [ "$RELEASE_PROFILE" != "alpha164-bridge" ] && [ "$RELEASE_TAG" != "v0.0.1-alpha.57" ]; then
+            preheat_args+=(--preheat-manifest dist/final/deployment-snapshot/preheat-manifest.json)
+            deployment_asset_args+=(
+              --compose dist/final/deployment-snapshot/compose.yaml
+              --third-party-policy dist/final/deployment-snapshot/third-party-image-policy.json
+            )
+          fi
           node scripts/ci/generate-public-channel.mjs \
             --tag "$RELEASE_TAG" --channel "$channel" --manifest dist/final/release.manifest.yaml \
             --runtime-composition dist/final/runtime-composition.json \
             --release-profile "$RELEASE_PROFILE" \
+            "${preheat_args[@]}" \
+            "${deployment_asset_args[@]}" \
             --output-dir "$channel_root" --publication-complete
           # The first successful publication can follow the frozen source
           # first tag, so do not manufacture a historical channel record.
@@ -2484,6 +2526,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          RELEASE_PROFILE: ${{ steps.release_profile.outputs.profile }}
           DEPLOYMENT_SNAPSHOT_COMMIT: ${{ steps.deployment.outputs.merge_sha }}
         run: |
           set -euo pipefail
@@ -2559,6 +2602,9 @@ jobs:
           }
           publish_asset dist/final/release.manifest.yaml
           publish_asset dist/final/runtime-composition.json
+          if [ "$RELEASE_PROFILE" != "alpha164-bridge" ] && [ "$RELEASE_TAG" != "v0.0.1-alpha.57" ]; then
+            publish_asset dist/final/deployment-snapshot/preheat-manifest.json
+          fi
           publish_asset dist/final/component-evidence.json
           publish_asset dist/final/public-release-provenance.json
           publish_asset "dist/final/deployment/lunafox-${RELEASE_TAG}.zip"
@@ -2570,6 +2616,7 @@ jobs:
           path: |
             dist/final/release.manifest.yaml
             dist/final/runtime-composition.json
+            dist/final/deployment-snapshot/preheat-manifest.json
             dist/final/runtime-composition.core.json
             dist/final/runtime-composition-finalization.json
             dist/final/runtime-composition-binding.json
