@@ -2320,15 +2320,28 @@ jobs:
       - name: Promote every Runtime digest to both final registries
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}
+          ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}
+          ORAS_GHCR_USERNAME: ${{ github.actor }}
+          ORAS_GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p dist/final/runtime-digests
           components=(server frontend nginx agent bootstrap)
-          resolve_digest() {
-            oras manifest fetch --descriptor "$1" 2>/dev/null | jq -r '.digest // empty' || true
-          }
+          oras_config="$(mktemp -d)"
           anonymous_config="$(mktemp -d)"
-          trap 'rm -rf "$anonymous_config"' EXIT
+          trap 'rm -rf "$oras_config" "$anonymous_config"' EXIT
+          printf '{"auths":{}}\n' > "$oras_config/config.json"
+          printf '%s' "$ORAS_DOCKERHUB_TOKEN" | oras login \
+            --registry-config "$oras_config/config.json" \
+            --username "$ORAS_DOCKERHUB_USERNAME" --password-stdin docker.io
+          printf '%s' "$ORAS_GHCR_TOKEN" | oras login \
+            --registry-config "$oras_config/config.json" \
+            --username "$ORAS_GHCR_USERNAME" --password-stdin ghcr.io
+          resolve_digest() {
+            oras manifest fetch --registry-config "$oras_config/config.json" \
+              --descriptor "$1" 2>/dev/null | jq -r '.digest // empty' || true
+          }
           printf '{"auths":{}}\n' > "$anonymous_config/config.json"
           plan="dist/final/composition-plan/runtime-composition-plan.json"
           test -f "$plan"
@@ -2395,22 +2408,28 @@ jobs:
               mv "$evidence_tmp" "$evidence"
             fi
             printf 'COMPONENT=%s\nDIGEST=%s\nEXPECTED_BUILD_DIGEST=%s\nREUSED_FINAL_TAG=%s\nSOURCE_REF=%s\nGHCR_REF=%s\nDOCKERHUB_REF=%s\n' "$component" "$digest" "$expected_digest" "$reused_final_tag" "$source_ref" "ghcr.io/yyhuni/lunafox-${component}@${digest}" "docker.io/yyhuni/lunafox-${component}@${digest}" > "dist/final/runtime-digests/${component}.env"
-            oras manifest fetch --descriptor "$source_ref" >/dev/null
+            oras manifest fetch --registry-config "$oras_config/config.json" \
+              --descriptor "$source_ref" >/dev/null
           done
           for component in "${components[@]}"; do
             source_ref="$(awk -F= '$1 == "SOURCE_REF" {print $2}' "dist/final/runtime-digests/${component}.env")"
             digest="$(awk -F= '$1 == "DIGEST" {print $2}' "dist/final/runtime-digests/${component}.env")"
             for registry in docker.io ghcr.io; do
               target="${registry}/yyhuni/lunafox-${component}:${RELEASE_TAG}"
-              existing="$(oras manifest fetch --descriptor "$target" 2>/dev/null | jq -r '.digest // empty' || true)"
+              existing="$(oras manifest fetch --registry-config "$oras_config/config.json" \
+                --descriptor "$target" 2>/dev/null | jq -r '.digest // empty' || true)"
               if [ -n "$existing" ] && [ "$existing" != "$digest" ]; then
                 echo "final tag already points to a different digest: $target" >&2
                 exit 1
               fi
               if [ -z "$existing" ]; then
-                oras cp "$source_ref" "$target"
+                oras cp \
+                  --from-registry-config "$oras_config/config.json" \
+                  --to-registry-config "$oras_config/config.json" \
+                  "$source_ref" "$target"
               fi
-              actual="$(oras manifest fetch --descriptor "$target" | jq -er '.digest')"
+              actual="$(oras manifest fetch --registry-config "$oras_config/config.json" \
+                --descriptor "$target" | jq -er '.digest')"
               [ "$actual" = "$digest" ] || { echo "cross-registry promotion drift: $target" >&2; exit 1; }
             done
           done
