@@ -787,18 +787,23 @@ jobs:
           destination_repository="$(jq -r '.destinationRepository // empty' PUBLIC_PROVENANCE.json)"
           release_tag="$(jq -r '.releaseTag // empty' PUBLIC_PROVENANCE.json)"
           source_revision_digest="$(jq -r '.sourceRevisionDigest // empty' PUBLIC_PROVENANCE.json)"
-          head_subject="$(git log -1 --format=%s)"
-          merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
-          squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
           [ "$generated_read_only" = true ] || { echo "public main is not a generated projection" >&2; exit 1; }
           [ "$source_repository" = "$PRIVATE_REPOSITORY" ] || { echo "unexpected private source repository: $source_repository" >&2; exit 1; }
           [ "$destination_repository" = "$PUBLIC_REPOSITORY" ] || { echo "unexpected destination repository: $destination_repository" >&2; exit 1; }
           [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "invalid generated release tag: $release_tag" >&2; exit 1; }
           [[ "$source_revision_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "invalid source revision digest" >&2; exit 1; }
-          [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
-            echo "public main HEAD is not a generated export merge: $head_subject" >&2
-            exit 1
-          }
+          # publication-intent already binds an authorized manual recovery to public main
+          # and this exact provenance Tag. Workflow maintenance changes HEAD, so only
+          # ordinary push releases must retain the generated-export HEAD subject.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            head_subject="$(git log -1 --format=%s)"
+            merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
+            squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
+            [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
+              echo "public main HEAD is not a generated export merge: $head_subject" >&2
+              exit 1
+            }
+          fi
           {
             echo "release_tag=$release_tag"
             echo "source_revision_digest=$source_revision_digest"
@@ -1043,13 +1048,18 @@ jobs:
           source_revision_digest="$(jq -er '.sourceRevisionDigest' PUBLIC_PROVENANCE.json)"
           [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 1
           [[ "$source_revision_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
-          head_subject="$(git log -1 --format=%s)"
-          merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
-          squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
-          [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
-            echo "public main HEAD is not the generated export merge: $head_subject" >&2
-            exit 1
-          }
+          # publication-intent is the sole authorization point for a manual recovery;
+          # it has already checked main, publish=true, and the provenance Tag before
+          # this job can run. Keep the legacy HEAD check for every other event.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            head_subject="$(git log -1 --format=%s)"
+            merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
+            squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
+            [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
+              echo "public main HEAD is not the generated export merge: $head_subject" >&2
+              exit 1
+            }
+          fi
           {
             echo "release_tag=$release_tag"
             echo "source_revision_digest=$source_revision_digest"
@@ -1254,7 +1264,7 @@ jobs:
   # authority; only its selected matrix children receive Registry credentials.
   public-engine-runtime-discover:
     # needs: [publication-intent, public-validation]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success'
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1263,7 +1273,7 @@ jobs:
     # contains(github.event.head_commit.modified, 'PUBLIC_EXPORT_MANIFEST.json')
     # needs: public-validation
     name: Discover Public Engine Runtime Image Matrix
-    needs: [publication-intent, public-validation, resolve-public-runtime-composition]
+    needs: [publication-intent, public-validation, resolve-public-runtime-composition, publish-runtime-images, publish-agent-image]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
