@@ -103,6 +103,7 @@ jobs:
             # Workflow maintenance is destination-owned and lands after its source
             # projection. Verify the unchanged source tree only after binding this
             # dispatch to the matching protected workflow-maintenance merge.
+            recovery_base="$(git rev-parse --verify HEAD^1)"
             recovery_parent="$(git rev-parse --verify HEAD^2)"
             release_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
             head_subject="$(git log -1 --format=%s)"
@@ -111,8 +112,12 @@ jobs:
               echo "authorized recovery must run from the matching workflow maintenance merge: $head_subject" >&2
               exit 1
             }
-            [ "$(git diff --name-only "$recovery_parent" HEAD)" = ".github/workflows/public-validate.yml" ] || {
-              echo "authorized recovery merge must only change the destination-owned workflow" >&2
+            [ "$(git diff --name-only "$recovery_base" "$recovery_parent")" = ".github/workflows/public-validate.yml" ] || {
+              echo "authorized recovery parents must differ only in the destination-owned workflow" >&2
+              exit 1
+            }
+            git diff --quiet "$recovery_parent" HEAD || {
+              echo "authorized recovery merge must resolve to the verified workflow-maintenance parent" >&2
               exit 1
             }
             git checkout --detach "$recovery_parent"
