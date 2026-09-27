@@ -6,6 +6,16 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Explicitly authorize immutable release recovery publication
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Existing release Tag recorded in PUBLIC_PROVENANCE.json
+        required: true
+        type: string
 
 # Every PR/export job is secretless and runs on GitHub-hosted infrastructure.
 # Publication is a separate protected-main job with its own least-privilege
@@ -456,10 +466,26 @@ jobs:
           fetch-depth: 2
       - id: intent
         name: Verify the source projection merge
+        env:
+          DISPATCH_PUBLISH: ${{ inputs.publish || '' }}
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag || '' }}
         shell: bash
         run: |
           set -euo pipefail
           echo "publish=false" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] || exit 0
+            [ "$DISPATCH_PUBLISH" = true ] || exit 0
+            test -f PUBLIC_PROVENANCE.json
+            release_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
+            [ "$DISPATCH_RELEASE_TAG" = "$release_tag" ] || {
+              echo "manual recovery Tag must exactly match PUBLIC_PROVENANCE.json" >&2
+              exit 1
+            }
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Verified explicit immutable recovery: publish=true"
+            exit 0
+          fi
           [ "$GITHUB_EVENT_NAME" = push ] || exit 0
           [ "$GITHUB_REF" = refs/heads/main ] || exit 0
           git rev-parse --verify HEAD^ >/dev/null
