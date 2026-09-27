@@ -694,25 +694,78 @@ jobs:
           fi
           node scripts/ci/resolve-public-runtime-composition.mjs "${initial_args[@]}" >/dev/null
           refs="$(jq -r '.components[].inputFingerprint.inputs.baseImages[].ref' dist/public-composition/initial-plan.json | sort -u)"
+          inspect_base_digest() {
+            local ref="$1" output
+            if output="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              awk '/^Digest:/ {print $2; exit}' <<<"$output"
+              return 0
+            fi
+            if grep -Eqi '429|too many requests|data limit exceeded|rate limit|temporarily unavailable|connection reset|connection refused|i/o timeout|tls handshake timeout|context deadline exceeded' <<<"$output"; then
+              return 75
+            fi
+            printf '%s\n' "$output" >&2
+            return 1
+          }
           for ref in $refs; do
+            transport_ref="$ref"
             case "$ref" in
-              *@sha256:*) identity="${ref##*@}" ;;
-              *)
-                identity=""
-                # Registry reads can fail closed after a single reset. Retry the
-                # inspect before treating the digest as unavailable.
-                for attempt in 1 2 3 4 5 6; do
-                  identity="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}' || true)"
-                  if [[ "$identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-                    break
-                  fi
-                  echo "base image identity unavailable on attempt ${attempt}: $ref" >&2
-                  if [ "$attempt" -lt 6 ]; then
-                    sleep $((attempt < 3 ? attempt * 2 : 8))
-                  fi
-                done
+              public.ecr.aws/docker/library/*)
+                transport_ref="docker.io/library/${ref#public.ecr.aws/docker/library/}"
+                ;;
+              public.ecr.aws/*)
+                echo "unsupported Public ECR base-image transport mapping: $ref" >&2
+                exit 1
                 ;;
             esac
+            source_identity=""
+            transport_identity=""
+            if [[ "$ref" == *@sha256:* ]]; then
+              source_identity="${ref##*@}"
+            else
+              # Registry reads can fail closed after a single reset. Retry the
+              # source inspect before using the reviewed Docker Hub transport.
+              for attempt in 1 2 3 4 5 6; do
+                if source_identity="$(inspect_base_digest "$ref")"; then
+                  :
+                else
+                  inspect_status=$?
+                  [ "$inspect_status" -eq 75 ] || exit "$inspect_status"
+                  source_identity=""
+                fi
+                if [[ "$source_identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  break
+                fi
+                echo "base image source identity unavailable on attempt ${attempt}: $ref" >&2
+                if [ "$attempt" -lt 6 ]; then
+                  sleep $((attempt < 3 ? attempt * 2 : 8))
+                fi
+              done
+            fi
+            if [[ "$ref" == public.ecr.aws/docker/library/* ]]; then
+              for attempt in 1 2 3 4 5 6; do
+                if transport_identity="$(inspect_base_digest "$transport_ref")"; then
+                  :
+                else
+                  inspect_status=$?
+                  [ "$inspect_status" -eq 75 ] || exit "$inspect_status"
+                  transport_identity=""
+                fi
+                if [[ "$transport_identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  break
+                fi
+                echo "Docker Hub base image identity unavailable on attempt ${attempt}: $transport_ref" >&2
+                if [ "$attempt" -lt 6 ]; then
+                  sleep $((attempt < 3 ? attempt * 2 : 8))
+                fi
+              done
+              if [[ "$source_identity" =~ ^sha256:[a-f0-9]{64}$ && "$source_identity" != "$transport_identity" ]]; then
+                echo "base image transport digest mismatch: $ref=$source_identity $transport_ref=$transport_identity" >&2
+                exit 1
+              fi
+              identity="$transport_identity"
+            else
+              identity="$source_identity"
+            fi
             if [[ "$identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
               tmp="$(mktemp)"
               jq --arg ref "$ref" --arg identity "$identity" '. + {($ref):$identity}' dist/public-composition/base-images.json >"$tmp"
@@ -905,6 +958,7 @@ jobs:
             --plan dist/public-composition/runtime-composition-plan.json \
             --component-id "$COMPONENT_ID" \
             --base-images dist/public-composition/base-images.json \
+            --transport dockerhub \
             --output "$output"
           {
             echo 'build_contexts<<EOF'
@@ -1171,6 +1225,7 @@ jobs:
             --plan dist/public-composition/runtime-composition-plan.json \
             --component-id runtime.agent \
             --base-images dist/public-composition/base-images.json \
+            --transport dockerhub \
             --output "$output"
           {
             echo 'build_contexts<<EOF'
@@ -1486,6 +1541,7 @@ jobs:
             --plan dist/public-composition/runtime-composition-plan.json \
             --component-id "$COMPONENT_ID" \
             --base-images dist/public-composition/base-images.json \
+            --transport dockerhub \
             --output "$output"
           echo "path=$output" >> "$GITHUB_OUTPUT"
       - name: Build and publish the selected native Engine platform by digest
