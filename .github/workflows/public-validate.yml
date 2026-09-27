@@ -2478,7 +2478,7 @@ jobs:
               unzip -t "$file" >/dev/null
             done
           test -f dist/final/deployment-snapshot/preheat-manifest.json
-          test "$(jq -er '.manifestDigest' dist/final/deployment-snapshot/preheat-manifest.json)" = "$(awk -F= '$1 == \"LUNAFOX_PREHEAT_MANIFEST_DIGEST\" {print $2}' dist/final/deployment-snapshot/.env)"
+          test "$(jq -er '.manifestDigest' dist/final/deployment-snapshot/preheat-manifest.json)" = "$(awk -F= '$1 == "LUNAFOX_PREHEAT_MANIFEST_DIGEST" {print $2}' dist/final/deployment-snapshot/.env)"
       - id: deployment
         name: Publish and verify the protected deployment snapshot
         env:
