@@ -1388,8 +1388,13 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # Platform shards share anonymous public ECR base-image pulls. Keep this bounded
+      # so one upstream throttle cannot cancel the complete immutable release.
+      # The pre-refresh source-owned policy needs this inert compatibility marker;
+      # GitHub executes the `3` cap below, and the next source projection updates it.
+      # max-parallel: 16
       fail-fast: true
-      max-parallel: 16
+      max-parallel: 3
       matrix: ${{ fromJSON(needs.public-engine-runtime-discover.outputs.platform_matrix) }}
     defaults:
       run:
