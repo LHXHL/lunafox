@@ -2307,6 +2307,7 @@ jobs:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           RUNTIME_COMPOSITION_SHA256: ${{ steps.composition.outputs.composition_digest }}
           RELEASE_PROFILE: ${{ steps.release_profile.outputs.profile }}
+          RELEASE_MIGRATION_TYPE: ${{ vars.RELEASE_MIGRATION_TYPE }}
         run: |
           set -euo pipefail
           mkdir -p dist/final
