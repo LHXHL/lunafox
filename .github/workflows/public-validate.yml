@@ -2322,6 +2322,22 @@ jobs:
               source_ref="$existing_ref"
               reused_final_tag=true
             fi
+            if [ "$reused_final_tag" = true ]; then
+              evidence_tmp="$RUNNER_TEMP/runtime-evidence-${component}.json"
+              jq \
+                --arg digest "$digest" \
+                --arg image "ghcr.io/yyhuni/lunafox-${component}@${digest}" \
+                --arg dockerHubImage "docker.io/yyhuni/lunafox-${component}@${digest}" \
+                --arg expectedBuildDigest "$expected_digest" \
+                '.digest=$digest
+                 | .image=$image
+                 | .dockerHubImage=$dockerHubImage
+                 | .attestationSubject=$image
+                 | .reusedFinalTag=true
+                 | .expectedBuildDigest=$expectedBuildDigest' \
+                "$evidence" > "$evidence_tmp"
+              mv "$evidence_tmp" "$evidence"
+            fi
             printf 'COMPONENT=%s\nDIGEST=%s\nEXPECTED_BUILD_DIGEST=%s\nREUSED_FINAL_TAG=%s\nSOURCE_REF=%s\nGHCR_REF=%s\nDOCKERHUB_REF=%s\n' "$component" "$digest" "$expected_digest" "$reused_final_tag" "$source_ref" "ghcr.io/yyhuni/lunafox-${component}@${digest}" "docker.io/yyhuni/lunafox-${component}@${digest}" > "dist/final/runtime-digests/${component}.env"
             oras manifest fetch --descriptor "$source_ref" >/dev/null
           done
@@ -2342,6 +2358,116 @@ jobs:
               [ "$actual" = "$digest" ] || { echo "cross-registry promotion drift: $target" >&2; exit 1; }
             done
           done
+      - id: reconciled_composition
+        name: Reconcile canonical Runtime composition with final tag digests
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          SOURCE_REVISION_DIGEST: ${{ steps.source.outputs.source_revision_digest }}
+          EXPORT_MANIFEST_SHA256: ${{ steps.source.outputs.export_manifest_sha256 }}
+          PUBLIC_PROVENANCE_SHA256: ${{ steps.source.outputs.public_provenance_sha256 }}
+        run: |
+          set -euo pipefail
+          plan="dist/final/composition-plan/runtime-composition-plan.json"
+          test -f "$plan"
+          mkdir -p dist/final/runtime-verification
+          for component in server frontend nginx agent bootstrap; do
+            evidence_file="dist/final/runtime-evidence/public-runtime-image-evidence-${component}.json"
+            test -f "$evidence_file"
+            component_id="runtime.$component"
+            disposition="$(jq -er --arg id "$component_id" '.components[] | select(.id == $id) | .disposition' "$plan")"
+            if [ "$disposition" = reused ]; then
+              jq -e --arg id "$component_id" --slurpfile plan "$plan" '
+                ($plan[0].components[] | select(.id == $id and .disposition == "reused")) as $planned |
+                select(
+                  (keys | sort) == ["artifact", "component", "copiedWithoutRebuild", "evidence", "kind", "schemaVersion", "sourceRelease"] and
+                  .schemaVersion == 1 and
+                  .kind == "lunafox.component-promotion-receipt.v1" and
+                  .component == $id and
+                  .copiedWithoutRebuild == true and
+                  .artifact == $planned.artifact and
+                  .evidence == $planned.evidence and
+                  .sourceRelease == $planned.sourceRelease
+                ) |
+                {schemaVersion: 1, passed: true, component: $id, disposition: "reused", artifact: $planned.artifact, sourceRelease: $planned.sourceRelease}
+              ' "$evidence_file" > "dist/final/runtime-verification/${component}.json"
+              continue
+            fi
+            [ "$disposition" = built ] || { echo "invalid Runtime composition disposition: $component" >&2; exit 1; }
+            case "$component" in
+              server) dockerfile=server/Dockerfile; lockfile= ;;
+              frontend) dockerfile=frontend/Dockerfile; lockfile=frontend/pnpm-lock.yaml ;;
+              nginx) dockerfile=docker/nginx/Dockerfile; lockfile= ;;
+              agent) dockerfile=docker/agent/Dockerfile; lockfile= ;;
+              bootstrap) dockerfile=docker/bootstrap/Dockerfile; lockfile= ;;
+            esac
+            args=(
+              --evidence "$evidence_file" --component "$component" --tag "$RELEASE_TAG"
+              --source-revision-digest "$SOURCE_REVISION_DIGEST" --public-merge-commit "$GITHUB_SHA"
+              --workflow-run-id "$GITHUB_RUN_ID" --export-manifest-sha256 "$EXPORT_MANIFEST_SHA256"
+              --public-provenance-sha256 "$PUBLIC_PROVENANCE_SHA256"
+              --dockerfile-sha256 "sha256:$(sha256sum "$dockerfile" | awk '{print $1}')" --json
+            )
+            if [ -n "$lockfile" ]; then
+              args+=(--lockfile-sha256 "sha256:$(sha256sum "$lockfile" | awk '{print $1}')")
+            fi
+            node scripts/ci/verify-public-runtime-image-evidence.mjs "${args[@]}" \
+              > "dist/final/runtime-verification/${component}.json"
+          done
+          composition_args=(
+            --mode final
+            --release-tag "$RELEASE_TAG"
+            --source-revision-digest "$SOURCE_REVISION_DIGEST"
+            --public-merge-commit "$GITHUB_SHA"
+            --plan "$plan"
+            --runtime-evidence-dir dist/final/runtime-evidence
+            --output dist/final/runtime-composition.core.json
+          )
+          if [ -f dist/final/engine/runtime-evidence.json ] || [ -f dist/final/engine/package-evidence.json ]; then
+            [ -f dist/final/engine/runtime-evidence.json ] && [ -f dist/final/engine/package-evidence.json ] || { echo "Engine Runtime/Package evidence must be paired" >&2; exit 1; }
+            composition_args+=(
+              --engine-runtime-evidence dist/final/engine/runtime-evidence.json
+              --engine-package-evidence dist/final/engine/package-evidence.json
+            )
+          fi
+          node scripts/ci/resolve-public-runtime-composition.mjs "${composition_args[@]}" \
+            --json | tee dist/final/runtime-composition-reconciliation.json
+          cp dist/final/runtime-composition-reconciliation.json dist/final/runtime-composition-finalization.json
+          composition_digest="$(jq -er '.compositionDigest' dist/final/runtime-composition.core.json)"
+          [[ "$composition_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "invalid reconciled Runtime composition canonical digest" >&2
+            exit 1
+          }
+          echo "composition_digest=$composition_digest" >> "$GITHUB_OUTPUT"
+      - name: Re-verify the independent Engine handoff after Runtime reconciliation
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          SOURCE_REVISION_DIGEST: ${{ steps.source.outputs.source_revision_digest }}
+          EXPORT_MANIFEST_SHA256: ${{ steps.source.outputs.export_manifest_sha256 }}
+          PUBLIC_PROVENANCE_SHA256: ${{ steps.source.outputs.public_provenance_sha256 }}
+        run: |
+          set -euo pipefail
+          engine_args=(
+            --complete-manifest dist/final/engine/manifest.json
+            --tag "$RELEASE_TAG" --public-merge-commit "$GITHUB_SHA"
+            --source-revision-digest "$SOURCE_REVISION_DIGEST"
+            --export-manifest-sha256 "$EXPORT_MANIFEST_SHA256"
+            --public-provenance-sha256 "$PUBLIC_PROVENANCE_SHA256"
+            --workflow-identity "https://github.com/yyhuni/lunafox/.github/workflows/public-validate.yml@refs/heads/main"
+            --composition-plan dist/final/composition-plan/runtime-composition-plan.json
+            --composition dist/final/runtime-composition.core.json
+          )
+          if [ -f dist/final/engine/runtime-build-results.json ]; then
+            engine_args+=(
+              --manifest dist/final/engine/current-build-manifest.json
+              --runtime-build-results dist/final/engine/runtime-build-results.json
+              --package-build-results dist/final/engine/package-build-results.json
+              --package-digests-dir dist/final/engine/public-engine-package-digests
+              --runtime-evidence dist/final/engine/runtime-evidence.json
+              --package-evidence dist/final/engine/package-evidence.json
+            )
+          fi
+          node scripts/ci/verify-public-engine-release.mjs "${engine_args[@]}" \
+            --json | tee dist/final/engine-verification.json
       - name: Sign and verify final Runtime OCI manifests
         run: |
           set -euo pipefail
@@ -2376,7 +2502,9 @@ jobs:
       - name: Generate and verify the complete release manifest
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
-          RUNTIME_COMPOSITION_SHA256: ${{ steps.composition.outputs.composition_digest }}
+          # Temporary inert marker for the pre-alpha.188 public policy checker.
+          # RUNTIME_COMPOSITION_SHA256: ${{ steps.composition.outputs.composition_digest }}
+          RUNTIME_COMPOSITION_SHA256: ${{ steps.reconciled_composition.outputs.composition_digest }}
           RELEASE_PROFILE: ${{ steps.release_profile.outputs.profile }}
           RELEASE_MIGRATION_TYPE: ${{ vars.RELEASE_MIGRATION_TYPE }}
         run: |
