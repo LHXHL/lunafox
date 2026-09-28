@@ -1013,7 +1013,9 @@ jobs:
           channel="canary"
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && channel="stable"
           channel_root="$recovery_root/channel"
-          mkdir -p "$channel_root/channels" "$channel_root/manifests"
+          channel_current_root="$recovery_root/channel-current"
+          mkdir -p "$channel_root/channels" "$channel_root/manifests" \
+            "$channel_current_root/channels" "$channel_current_root/manifests"
           channel_ref_response="$recovery_root/release-channel-before.json"
           channel_exists=false
           if gh api "/repos/$PUBLIC_REPOSITORY/git/ref/heads/release-channel" > "$channel_ref_response" 2>/dev/null; then
@@ -1045,8 +1047,6 @@ jobs:
             --output-dir "$channel_root" \
             --publication-complete \
             > "$recovery_root/channel-generation.json"
-          node "$snapshot_root/scripts/ci/check-public-channel.mjs" \
-            --root-dir "$channel_root" > "$recovery_root/channel-verification.json"
           immutable_channel_files=(
             "channels/$RELEASE_TAG.env"
             "manifests/$RELEASE_TAG.yaml"
@@ -1055,8 +1055,20 @@ jobs:
             "manifests/$RELEASE_TAG/compose.yaml"
             "manifests/$RELEASE_TAG/third-party-image-policy.json"
           )
-          for relative in "${immutable_channel_files[@]}"; do
+          current_channel_files=(
+            "channels/$channel.env"
+            "${immutable_channel_files[@]}"
+          )
+          # Historical records are immutable but can predate the current schema.
+          # Verify only the newly generated record before preserving that history.
+          for relative in "${current_channel_files[@]}"; do
             [ -f "$channel_root/$relative" ] || fail "generated release-channel record is missing: $relative"
+            mkdir -p "$(dirname "$channel_current_root/$relative")"
+            cp "$channel_root/$relative" "$channel_current_root/$relative"
+          done
+          node "$snapshot_root/scripts/ci/check-public-channel.mjs" \
+            --root-dir "$channel_current_root" > "$recovery_root/channel-verification.json"
+          for relative in "${immutable_channel_files[@]}"; do
             if [ -e "$channel_worktree/$relative" ]; then
               [ -f "$channel_worktree/$relative" ] && cmp -s "$channel_worktree/$relative" "$channel_root/$relative" ||
                 fail "existing immutable release-channel record conflicts: $relative"
