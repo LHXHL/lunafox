@@ -681,6 +681,7 @@ jobs:
       contents: read
     outputs:
       publish: ${{ steps.intent.outputs.publish }}
+      recovery: ${{ steps.intent.outputs.recovery }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -694,6 +695,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "recovery=false" >> "$GITHUB_OUTPUT"
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             [ "$GITHUB_REF" = refs/heads/main ] || exit 0
             [ "$DISPATCH_PUBLISH" = true ] || exit 0
@@ -704,6 +706,7 @@ jobs:
               exit 1
             }
             echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "recovery=true" >> "$GITHUB_OUTPUT"
             echo "Verified explicit immutable recovery: publish=true"
             exit 0
           fi
@@ -722,13 +725,500 @@ jobs:
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "Verified protected source projection: publish=true"
 
+  # A historical deployment snapshot is the authority for this lane. It must
+  # never return to the normal release graph, because that graph can create a
+  # different OCI closure before discovering the already-merged snapshot.
+  recover-immutable-public-release:
+    if: needs.publication-intent.outputs.recovery == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success'
+    name: Recover Immutable Public Release
+    needs: [publication-intent, public-validation]
+    runs-on: ubuntu-22.04
+    environment: public-release
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install public snapshot verification dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/engine-oci-publish/go.mod
+          cache-dependency-path: |
+            tools/engine-oci-publish/go.sum
+            contracts/go.sum
+      - uses: oras-project/setup-oras@v1
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Verify immutable snapshot and publish terminal metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          recovery_root="$GITHUB_WORKSPACE/dist/immutable-recovery"
+          snapshot_root=""
+          channel_worktree=""
+          anonymous_config=""
+          snapshot_sha=""
+          mkdir -p "$recovery_root"
+          fail() {
+            echo "immutable public release recovery failed: $*" >&2
+            exit 1
+          }
+          cleanup() {
+            status=$?
+            set +e
+            jq -n \
+              --arg tag "$RELEASE_TAG" \
+              --arg snapshot "$snapshot_sha" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg status "$status" \
+              '{schemaVersion:1,kind:"lunafox.immutable-public-release-recovery-run.v1",releaseTag:$tag,snapshotCommit:($snapshot // null),run:$run,status:($status | tonumber)}' \
+              > "$recovery_root/run-result.json"
+            if [ -n "$snapshot_root" ] && [[ "$snapshot_root" == "$RUNNER_TEMP"/immutable-public-release-snapshot-* ]]; then
+              git worktree remove --force "$snapshot_root" >/dev/null 2>&1 || true
+            fi
+            if [ -n "$channel_worktree" ] && [[ "$channel_worktree" == "$RUNNER_TEMP"/immutable-public-release-channel-* ]]; then
+              rm -rf -- "$channel_worktree"
+            fi
+            if [ -n "$anonymous_config" ] && [[ "$anonymous_config" == "$RUNNER_TEMP"/immutable-public-release-anonymous-registry-* ]]; then
+              rm -rf -- "$anonymous_config"
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          test -f PUBLIC_PROVENANCE.json
+          current_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
+          [ "$RELEASE_TAG" = "$current_tag" ] || fail "dispatch tag is not bound to checked-out provenance"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || fail "dispatch tag is invalid"
+
+          snapshot_candidates="$(
+            git log --first-parent --format='%H%x09%s' HEAD |
+              awk -F '\t' -v tag="$RELEASE_TAG" \
+                'index($2, "chore(deploy): finalize deployment snapshot " tag " (#") == 1 && $2 ~ /\(#[0-9]+\)$/ { print $1 }'
+          )"
+          snapshot_count="$(printf '%s\n' "$snapshot_candidates" | awk 'NF { count += 1 } END { print count + 0 }')"
+          [ "$snapshot_count" = 1 ] || fail "expected one authorized deployment snapshot, found $snapshot_count"
+          snapshot_sha="$snapshot_candidates"
+          snapshot_subject="$(git log -1 --format=%s "$snapshot_sha")"
+          snapshot_pr="$(printf '%s\n' "$snapshot_subject" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')"
+          [ -n "$snapshot_pr" ] || fail "snapshot subject is missing a merged pull request number"
+          git merge-base --is-ancestor "$snapshot_sha" HEAD || fail "snapshot is not an ancestor of protected main"
+          if git rev-parse --verify "$snapshot_sha^2" >/dev/null 2>&1; then
+            fail "snapshot must have exactly one parent"
+          fi
+          snapshot_parent="$(git rev-parse --verify "$snapshot_sha^1")"
+          [ "$(git log -1 --format=%cn "$snapshot_sha")" = GitHub ] || fail "snapshot committer is not GitHub"
+          [ "$(git log -1 --format=%ce "$snapshot_sha")" = noreply@github.com ] || fail "snapshot committer email is not authorized"
+          expected_snapshot_files="$(
+            printf '%s\n' \
+              .env \
+              .env.example \
+              compose.yaml \
+              engine-inventory.yaml \
+              preheat-manifest.json \
+              release.manifest.yaml \
+              runtime-composition.json \
+              third-party-image-policy.json |
+              LC_ALL=C sort
+          )"
+          actual_snapshot_files="$(git diff-tree --no-commit-id --name-only -r "$snapshot_parent" "$snapshot_sha" | LC_ALL=C sort)"
+          [ "$actual_snapshot_files" = "$expected_snapshot_files" ] || fail "snapshot changed files are not the exact deployment closure"
+
+          gh api "/repos/$PUBLIC_REPOSITORY/pulls/$snapshot_pr" > "$recovery_root/snapshot-pull-request.json"
+          jq -e \
+            --arg sha "$snapshot_sha" \
+            --arg title "chore(deploy): finalize deployment snapshot $RELEASE_TAG" \
+            '.state == "closed" and .merged_at != null and .merge_commit_sha == $sha and .base.ref == "main" and .title == $title' \
+            "$recovery_root/snapshot-pull-request.json" >/dev/null ||
+            fail "snapshot pull request is not the authorized protected-main merge"
+
+          snapshot_root="$RUNNER_TEMP/immutable-public-release-snapshot-$GITHUB_RUN_ID-$RANDOM"
+          git worktree add --detach "$snapshot_root" "$snapshot_sha"
+          cmp -s PUBLIC_PROVENANCE.json "$snapshot_root/PUBLIC_PROVENANCE.json" ||
+            fail "current provenance differs from the authorized deployment snapshot"
+          snapshot_source_digest="$(jq -er '.sourceRevisionDigest' "$snapshot_root/PUBLIC_PROVENANCE.json")"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg source "$snapshot_source_digest" \
+            --arg private_repository "$PRIVATE_REPOSITORY" \
+            --arg public_repository "$PUBLIC_REPOSITORY" \
+            '.generatedReadOnly == true and .releaseTag == $tag and .sourceRevisionDigest == $source and .sourceRepository == $private_repository and .destinationRepository == $public_repository' \
+            "$snapshot_root/PUBLIC_PROVENANCE.json" >/dev/null ||
+            fail "snapshot public provenance is not bound to this release"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg source "$snapshot_source_digest" \
+            '.generatedReadOnly == true and .releaseTag == $tag and .sourceRevisionDigest == $source' \
+            "$snapshot_root/PUBLIC_EXPORT_MANIFEST.json" >/dev/null ||
+            fail "snapshot export manifest is not bound to public provenance"
+
+          release_version="$(printf '%s' "$RELEASE_TAG" | sed 's/^v//')"
+          release_profile="$(node "$snapshot_root/scripts/ci/release-compatibility-profile.mjs" --release-version "$release_version")"
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg snapshot "$snapshot_sha" \
+            --arg parent "$snapshot_parent" \
+            --arg pr "$snapshot_pr" \
+            --arg profile "$release_profile" \
+            --arg source "$snapshot_source_digest" \
+            '{schemaVersion:1,kind:"lunafox.immutable-public-release-snapshot.v1",releaseTag:$tag,snapshotCommit:$snapshot,parentCommit:$parent,pullRequest:($pr | tonumber),releaseProfile:$profile,sourceRevisionDigest:$source}' \
+            > "$recovery_root/snapshot-identity.json"
+
+          # public-validation has already verified the source-export history on
+          # its recovery-compatible checkout. Re-running its full-history
+          # validator on the snapshot would reject known legacy maintenance
+          # commits rather than prove anything about this immutable closure.
+          node "$snapshot_root/scripts/ci/verify-public-release.mjs" \
+            --root-dir "$snapshot_root" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --tag "$RELEASE_TAG" \
+            --release-profile "$release_profile" \
+            --probe --json \
+            > "$recovery_root/release-verification.json"
+          node "$snapshot_root/scripts/ci/verify-release-component-composition.mjs" \
+            --composition "$snapshot_root/runtime-composition.json" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --release-profile "$release_profile" --json \
+            > "$recovery_root/composition-verification.json"
+          bash "$snapshot_root/scripts/ci/verify-public-deployment.sh" \
+            --root-dir "$snapshot_root" \
+            --evidence "$recovery_root/deployment-verification.json" \
+            > "$recovery_root/deployment-verification.log"
+
+          mkdir -p "$recovery_root/deployment" "$recovery_root/generated-snapshot"
+          node "$snapshot_root/scripts/ci/generate-compose-deployment.mjs" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --tag "$RELEASE_TAG" \
+            --runtime-composition "$snapshot_root/runtime-composition.json" \
+            --release-profile "$release_profile" \
+            --output "$recovery_root/deployment" \
+            --snapshot "$recovery_root/generated-snapshot" \
+            > "$recovery_root/deployment-packages.json"
+          jq -e --arg name "lunafox-$RELEASE_TAG.zip" \
+            'length == 1 and .[0].name == $name and (.[0].sha256 | test("^[a-f0-9]{64}$"))' \
+            "$recovery_root/deployment-packages.json" >/dev/null ||
+            fail "generated deployment package inventory is invalid"
+          for snapshot_file in \
+            .env \
+            .env.example \
+            compose.yaml \
+            engine-inventory.yaml \
+            preheat-manifest.json \
+            release.manifest.yaml \
+            runtime-composition.json \
+            third-party-image-policy.json; do
+            cmp -s "$snapshot_root/$snapshot_file" "$recovery_root/generated-snapshot/$snapshot_file" ||
+              fail "regenerated deployment closure differs from the authorized snapshot: $snapshot_file"
+          done
+          zip_file="$recovery_root/deployment/lunafox-$RELEASE_TAG.zip"
+          expected_zip_sha="$(jq -er '.[0].sha256' "$recovery_root/deployment-packages.json")"
+          actual_zip_sha="$(sha256sum "$zip_file" | awk '{print $1}')"
+          [ "$actual_zip_sha" = "$expected_zip_sha" ] || fail "generated deployment ZIP digest is not deterministic"
+          unzip -t "$zip_file" >/dev/null
+
+          anonymous_config="$RUNNER_TEMP/immutable-public-release-anonymous-registry-$GITHUB_RUN_ID-$RANDOM"
+          mkdir -p "$anonymous_config"
+          printf '{"auths":{}}\n' > "$anonymous_config/config.json"
+          (cd "$snapshot_root/tools/engine-oci-publish" && go build -o "$RUNNER_TEMP/verify-immutable-recovery-signature" ./cmd/verify-signature)
+          registry_root="$recovery_root/registry"
+          mkdir -p "$registry_root/descriptors" "$registry_root/manifests" "$registry_root/platforms" "$registry_root/signatures" "$registry_root/records"
+          # Keep the historical public policy's four production call sites stable
+          # while applying the same strict workflow identity in this recovery lane.
+          public_cosign_identity="^https://github\.com/yyhuni/lunafox/\.github/workflows/public-validate\.yml@refs/heads/main$"
+          component_count=0
+          while IFS=$'\t' read -r component_id component_kind source_ref digest platforms; do
+            case "$component_kind" in
+              runtime|engine) ;;
+              *) fail "runtime composition contains an unsupported component kind: $component_kind" ;;
+            esac
+            [[ "$source_ref" =~ ^(docker\.io|ghcr\.io)/yyhuni/[A-Za-z0-9._-]+@sha256:[a-f0-9]{64}$ ]] ||
+              fail "runtime composition contains an invalid first-party artifact ref: $component_id"
+            digest_from_ref="$(printf '%s' "$source_ref" | awk -F@ '{print $2}')"
+            [ "$digest_from_ref" = "$digest" ] || fail "runtime composition digest/ref drift: $component_id"
+            safe_id="$(printf '%s' "$component_id" | tr -c 'A-Za-z0-9_.-' '_')"
+            repository="$(printf '%s' "$source_ref" | sed -E 's#^[^/]+/##; s#@.*$##')"
+            docker_ref="docker.io/$repository@$digest"
+            ghcr_ref="ghcr.io/$repository@$digest"
+            for registry in docker.io ghcr.io; do
+              ref="$registry/$repository@$digest"
+              registry_label="$(printf '%s' "$registry" | tr . _)"
+              descriptor_file="$registry_root/descriptors/$safe_id-$registry_label.json"
+              signature_file="$registry_root/signatures/$safe_id-$registry_label.json"
+              oras manifest fetch \
+                --registry-config "$anonymous_config/config.json" \
+                --descriptor "$ref" > "$descriptor_file"
+              jq -e --arg digest "$digest" '.digest == $digest and (.mediaType | type == "string")' "$descriptor_file" >/dev/null ||
+                fail "anonymous descriptor digest verification failed: $ref"
+              DOCKER_CONFIG="$anonymous_config" "$RUNNER_TEMP/verify-immutable-recovery-signature" "$ref" \
+                > "$registry_root/signatures/$safe_id-$registry_label.go.log"
+              DOCKER_CONFIG="$anonymous_config" cosign verify \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-identity-regexp "$public_cosign_identity" \
+                "$ref" > "$signature_file"
+              jq -e 'type == "array" and length > 0' "$signature_file" >/dev/null ||
+                fail "anonymous keyless signature verification failed: $ref"
+              if [ -n "$platforms" ]; then
+                raw_manifest="$registry_root/manifests/$safe_id-$registry_label.json"
+                platform_evidence="$registry_root/platforms/$safe_id-$registry_label.json"
+                oras manifest fetch \
+                  --registry-config "$anonymous_config/config.json" \
+                  "$ref" > "$raw_manifest"
+                node "$snapshot_root/scripts/ci/verify-runtime-image-index.mjs" \
+                  --raw-file "$raw_manifest" \
+                  --expected-digest "$digest" \
+                  --expected-platforms "$platforms" \
+                  > "$platform_evidence"
+              fi
+            done
+            jq -n \
+              --arg component "$component_id" \
+              --arg kind "$component_kind" \
+              --arg digest "$digest" \
+              --arg docker_ref "$docker_ref" \
+              --arg ghcr_ref "$ghcr_ref" \
+              --arg platforms "$platforms" \
+              --slurpfile docker_descriptor "$registry_root/descriptors/$safe_id-docker_io.json" \
+              --slurpfile ghcr_descriptor "$registry_root/descriptors/$safe_id-ghcr_io.json" \
+              '{schemaVersion:1,component:$component,kind:$kind,digest:$digest,dockerHub:{ref:$docker_ref,descriptorDigest:$docker_descriptor[0].digest},ghcr:{ref:$ghcr_ref,descriptorDigest:$ghcr_descriptor[0].digest},platforms:(if $platforms == "" then [] else $platforms | split(",") end),anonymous:true,keylessSignatureVerified:true}' \
+              > "$registry_root/records/$safe_id.json"
+            component_count=$((component_count + 1))
+          done < <(
+            jq -r '.components[] | [.id,.kind,.artifact.ref,.artifact.digest,((.artifact.platforms // []) | join(","))] | @tsv' \
+              "$snapshot_root/runtime-composition.json"
+          )
+          [ "$component_count" -gt 0 ] || fail "runtime composition did not contain a recoverable artifact inventory"
+          jq -s --arg tag "$RELEASE_TAG" \
+            '{schemaVersion:1,kind:"lunafox.immutable-public-release-registry-evidence.v1",releaseTag:$tag,passed:true,records:sort_by(.component)}' \
+            "$registry_root/records/"*.json > "$registry_root/evidence.json"
+
+          channel="canary"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && channel="stable"
+          channel_root="$recovery_root/channel"
+          mkdir -p "$channel_root/channels" "$channel_root/manifests"
+          channel_ref_response="$recovery_root/release-channel-before.json"
+          channel_exists=false
+          if gh api "/repos/$PUBLIC_REPOSITORY/git/ref/heads/release-channel" > "$channel_ref_response" 2>/dev/null; then
+            channel_exists=true
+          else
+            channel_ref_status="$(jq -r '.status // empty' "$channel_ref_response" 2>/dev/null || true)"
+            [ "$channel_ref_status" = "404" ] || fail "failed to resolve release-channel branch (status: $channel_ref_status)"
+          fi
+          channel_worktree="$RUNNER_TEMP/immutable-public-release-channel-$GITHUB_RUN_ID-$RANDOM"
+          if [ "$channel_exists" = true ]; then
+            git clone --depth 1 --branch release-channel "https://x-access-token:$GH_TOKEN@github.com/$PUBLIC_REPOSITORY.git" "$channel_worktree" ||
+              fail "failed to clone the verified release-channel branch"
+            if [ -d "$channel_worktree/channels" ]; then cp -a "$channel_worktree/channels/." "$channel_root/channels/"; fi
+            if [ -d "$channel_worktree/manifests" ]; then cp -a "$channel_worktree/manifests/." "$channel_root/manifests/"; fi
+          else
+            git init "$channel_worktree" >/dev/null
+            git -C "$channel_worktree" remote add origin "https://x-access-token:$GH_TOKEN@github.com/$PUBLIC_REPOSITORY.git"
+            git -C "$channel_worktree" checkout --orphan release-channel >/dev/null
+          fi
+          node "$snapshot_root/scripts/ci/generate-public-channel.mjs" \
+            --tag "$RELEASE_TAG" \
+            --channel "$channel" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --runtime-composition "$snapshot_root/runtime-composition.json" \
+            --release-profile "$release_profile" \
+            --preheat-manifest "$snapshot_root/preheat-manifest.json" \
+            --compose "$snapshot_root/compose.yaml" \
+            --third-party-policy "$snapshot_root/third-party-image-policy.json" \
+            --output-dir "$channel_root" \
+            --publication-complete \
+            > "$recovery_root/channel-generation.json"
+          node "$snapshot_root/scripts/ci/check-public-channel.mjs" \
+            --root-dir "$channel_root" > "$recovery_root/channel-verification.json"
+          immutable_channel_files=(
+            "channels/$RELEASE_TAG.env"
+            "manifests/$RELEASE_TAG.yaml"
+            "manifests/$RELEASE_TAG/runtime-composition.json"
+            "manifests/$RELEASE_TAG/preheat-manifest.json"
+            "manifests/$RELEASE_TAG/compose.yaml"
+            "manifests/$RELEASE_TAG/third-party-image-policy.json"
+          )
+          for relative in "${immutable_channel_files[@]}"; do
+            [ -f "$channel_root/$relative" ] || fail "generated release-channel record is missing: $relative"
+            if [ -e "$channel_worktree/$relative" ]; then
+              [ -f "$channel_worktree/$relative" ] && cmp -s "$channel_worktree/$relative" "$channel_root/$relative" ||
+                fail "existing immutable release-channel record conflicts: $relative"
+            fi
+          done
+          if [ -f "$channel_worktree/channels/$channel.env" ] &&
+              grep -Fxq "VERSION=$RELEASE_TAG" "$channel_worktree/channels/$channel.env"; then
+            cmp -s "$channel_worktree/channels/$channel.env" "$channel_root/channels/$channel.env" ||
+              fail "existing $channel channel alias conflicts with this release"
+          fi
+
+          release_response="$recovery_root/release-before.json"
+          release_exists=false
+          if gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_response" 2>/dev/null; then
+            release_exists=true
+          else
+            release_status="$(jq -r '.status // empty' "$release_response" 2>/dev/null || true)"
+            [ "$release_status" = "404" ] || fail "failed to resolve GitHub Release (status: $release_status)"
+          fi
+          notes_file="$snapshot_root/release-notes/$RELEASE_TAG.md"
+          [ -f "$notes_file" ] || fail "snapshot release notes are missing"
+          prerelease=false
+          [[ "$RELEASE_TAG" =~ -(alpha|beta|rc)\.[0-9]+$ ]] && prerelease=true
+          if [ "$release_exists" = true ]; then
+            jq -e --arg tag "$RELEASE_TAG" --argjson prerelease "$prerelease" \
+              '.tag_name == $tag and .name == $tag and .draft == false and .prerelease == $prerelease' \
+              "$release_response" >/dev/null ||
+              fail "existing GitHub Release metadata conflicts with the immutable snapshot"
+            expected_notes="$(<"$notes_file")"
+            actual_notes="$(jq -r '.body // ""' "$release_response")"
+            [ "$actual_notes" = "$expected_notes" ] || fail "existing GitHub Release notes conflict with the immutable snapshot"
+          fi
+          tag_ref_response="$recovery_root/tag-before.json"
+          tag_sha=""
+          if gh api "/repos/$PUBLIC_REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$tag_ref_response" 2>/dev/null; then
+            tag_sha="$(jq -er '.object.sha' "$tag_ref_response")"
+            [ "$(jq -er '.object.type' "$tag_ref_response")" = commit ] ||
+              fail "existing immutable tag is not a lightweight commit tag"
+          else
+            tag_ref_status="$(jq -r '.status // empty' "$tag_ref_response" 2>/dev/null || true)"
+            [ "$tag_ref_status" = "404" ] || fail "failed to resolve immutable tag (status: $tag_ref_status)"
+          fi
+          [ -z "$tag_sha" ] || [ "$tag_sha" = "$snapshot_sha" ] ||
+            fail "existing immutable tag points to a different commit"
+
+          static_release_assets=(
+            "$snapshot_root/release.manifest.yaml"
+            "$snapshot_root/runtime-composition.json"
+            "$snapshot_root/preheat-manifest.json"
+            "$zip_file"
+            "$recovery_root/deployment-packages.json"
+          )
+          verify_existing_asset() {
+            local file="$1" name expected actual asset_list asset_count asset_json url temporary
+            [ "$release_exists" = true ] || return 0
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            asset_list="$(jq -c --arg name "$name" '[.assets[]? | select(.name == $name)]' "$release_response")"
+            asset_count="$(jq -er 'length' <<<"$asset_list")"
+            [ "$asset_count" -le 1 ] || fail "existing Release has duplicate asset: $name"
+            [ "$asset_count" -eq 0 ] && return 0
+            asset_json="$(jq -ce '.[0]' <<<"$asset_list")"
+            actual="$(jq -r '.digest // empty' <<<"$asset_json")"
+            if [ "$actual" != "$expected" ]; then
+              url="$(jq -er '.url' <<<"$asset_json")"
+              temporary="$(mktemp)"
+              curl --fail --location --silent --show-error \
+                -H 'Accept: application/octet-stream' \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                "$url" -o "$temporary"
+              actual="sha256:$(sha256sum "$temporary" | awk '{print $1}')"
+              rm -f "$temporary"
+            fi
+            [ "$actual" = "$expected" ] || fail "existing Release asset conflicts: $name"
+          }
+          for asset in "${static_release_assets[@]}"; do
+            verify_existing_asset "$asset"
+          done
+
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg snapshot "$snapshot_sha" \
+            --arg profile "$release_profile" \
+            --arg composition "$(jq -er '.compositionDigest' "$snapshot_root/runtime-composition.json")" \
+            --arg manifest "sha256:$(sha256sum "$snapshot_root/release.manifest.yaml" | awk '{print $1}')" \
+            --arg zip "sha256:$actual_zip_sha" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{schemaVersion:1,kind:"lunafox.immutable-public-release-recovery-evidence.v1",status:"verified",releaseTag:$tag,deploymentSnapshotCommit:$snapshot,releaseProfile:$profile,runtimeCompositionDigest:$composition,releaseManifestSha256:$manifest,deploymentZipSha256:$zip,verificationRun:$run}' \
+            > "$recovery_root/immutable-recovery-evidence.json"
+
+          if [ -z "$tag_sha" ]; then
+            gh api --method POST "/repos/$PUBLIC_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$snapshot_sha" >/dev/null
+          fi
+          rm -rf -- "$channel_worktree/channels" "$channel_worktree/manifests"
+          mkdir -p "$channel_worktree/channels" "$channel_worktree/manifests"
+          cp -a "$channel_root/channels/." "$channel_worktree/channels/"
+          cp -a "$channel_root/manifests/." "$channel_worktree/manifests/"
+          git -C "$channel_worktree" config user.name "github-actions[bot]"
+          git -C "$channel_worktree" config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "$channel_worktree" add channels manifests
+          if ! git -C "$channel_worktree" diff --cached --quiet; then
+            git -C "$channel_worktree" commit -m "chore(channel): recover $channel at $RELEASE_TAG"
+            git -C "$channel_worktree" push origin release-channel
+          fi
+
+          if [ "$release_exists" = false ]; then
+            release_args=(
+              "$RELEASE_TAG"
+              --repo "$PUBLIC_REPOSITORY"
+              --verify-tag
+              --title "$RELEASE_TAG"
+              --notes-file "$notes_file"
+            )
+            [ "$prerelease" = true ] && release_args+=(--prerelease)
+            gh release create "${release_args[@]}"
+          fi
+          publish_asset() {
+            local file="$1" name expected actual asset_list asset_count asset_json url temporary
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            asset_list="$(gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" | jq -c --arg name "$name" '[.assets[]? | select(.name == $name)]')"
+            asset_count="$(jq -er 'length' <<<"$asset_list")"
+            [ "$asset_count" -le 1 ] || fail "Release has duplicate asset: $name"
+            if [ "$asset_count" -eq 0 ]; then
+              gh release upload "$RELEASE_TAG" --repo "$PUBLIC_REPOSITORY" "$file"
+              asset_list="$(gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" | jq -c --arg name "$name" '[.assets[]? | select(.name == $name)]')"
+              asset_count="$(jq -er 'length' <<<"$asset_list")"
+              [ "$asset_count" -eq 1 ] || fail "Release upload did not produce one asset: $name"
+            fi
+            asset_json="$(jq -ce '.[0]' <<<"$asset_list")"
+            actual="$(jq -r '.digest // empty' <<<"$asset_json")"
+            if [ "$actual" != "$expected" ]; then
+              url="$(jq -er '.url' <<<"$asset_json")"
+              temporary="$(mktemp)"
+              curl --fail --location --silent --show-error \
+                -H 'Accept: application/octet-stream' \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                "$url" -o "$temporary"
+              actual="sha256:$(sha256sum "$temporary" | awk '{print $1}')"
+              rm -f "$temporary"
+            fi
+            [ "$actual" = "$expected" ] || fail "Release asset conflicts: $name"
+          }
+          for asset in "${static_release_assets[@]}"; do
+            publish_asset "$asset"
+          done
+          gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" > "$recovery_root/release-after.json"
+      - name: Upload immutable recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-public-release-recovery-${{ github.run_id }}
+          path: dist/immutable-recovery/**
+          if-no-files-found: warn
+
   # Resolve the complete deployable input identity before any Registry
   # publication. Reuse is granted only from a prior release's canonical
   # composition and immutable evidence. No prior asset means a full built
   # plan; a discovered asset that fails verification fails the release closed
   # rather than silently weakening the evidence boundary.
   resolve-public-runtime-composition:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success'
     name: Resolve Public Runtime Composition
     needs: [publication-intent, public-validation]
     runs-on: ubuntu-22.04
@@ -1001,7 +1491,7 @@ jobs:
   publish-runtime-images:
     # if: steps.preflight.outputs.commit_digest == ''
     # image_digest="${BUILT_DIGEST:-$EXISTING_DIGEST}"
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
     # Temporary inert markers let the pre-alpha.118 policy checker validate
     # this maintenance PR while the executable condition uses repository history.
     # needs: [publication-intent, public-validation]
@@ -1268,7 +1758,7 @@ jobs:
     # --public-export-root
     # refs/tags/${RELEASE_TAG}$
     # context: ${{ steps.verify.outputs.bundle_dir }}
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # needs: [publication-intent, public-validation]
     # github.repository == 'yyhuni/lunafox'
@@ -1538,7 +2028,7 @@ jobs:
   # authority; only its selected matrix children receive Registry credentials.
   public-engine-runtime-discover:
     # needs: [publication-intent, public-validation]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success'
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1646,7 +2136,7 @@ jobs:
           if-no-files-found: error
 
   public-engine-runtime-build:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1756,7 +2246,7 @@ jobs:
           if-no-files-found: error
 
   public-engine-runtime-finalize:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0 && needs.public-engine-runtime-build.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0 && needs.public-engine-runtime-build.result == 'success'
     name: Finalize Public Engine Runtime Image (${{ matrix.engineId }})
     needs: [publication-intent, public-engine-runtime-discover, public-engine-runtime-build]
     runs-on: ubuntu-24.04
@@ -1870,7 +2360,7 @@ jobs:
           rm -rf -- "$ENGINE_REGISTRY_AUTH_ROOT"
 
   public-engine-runtime-aggregate:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && (needs.public-engine-runtime-finalize.result == 'success' || (fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0 && needs.public-engine-runtime-finalize.result == 'skipped'))
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && (needs.public-engine-runtime-finalize.result == 'success' || (fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0 && needs.public-engine-runtime-finalize.result == 'skipped'))
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1935,7 +2425,7 @@ jobs:
 
   public-engine-runtime-sign:
     # needs: [publication-intent, public-engine-runtime-aggregate]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -2039,7 +2529,7 @@ jobs:
 
   public-engine-package-build:
     # needs: [publication-intent, public-engine-runtime-sign]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-sign.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-sign.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -2124,7 +2614,7 @@ jobs:
 
   public-engine-package-publish:
     # needs: [publication-intent, public-engine-package-build]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-package-build.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-package-build.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -2266,7 +2756,7 @@ jobs:
     # needs: [publication-intent, public-engine-package-publish]
     # engine-release-manifest.json
     # verify-public-engine-release.mjs
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && (needs.public-engine-package-publish.result == 'success' || fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0)
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && (needs.public-engine-package-publish.result == 'success' || fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0)
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -2355,7 +2845,7 @@ jobs:
   # or GitHub Release mutation is attempted.
   publish-final-release:
     # needs: [publication-intent, publish-runtime-images, publish-agent-image, public-engine-release-manifest]
-    if: always() && needs.publication-intent.outputs.publish == 'true' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success' && needs.public-engine-release-manifest.result == 'success'
+    if: always() && needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success' && needs.public-engine-release-manifest.result == 'success'
     # Temporary inert marker for the pre-alpha.118 policy checker.
     # contains(github.event.head_commit.modified, 'PUBLIC_EXPORT_MANIFEST.json')
     name: Publish Final Runtime Release
