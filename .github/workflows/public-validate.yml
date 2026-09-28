@@ -1160,9 +1160,16 @@ jobs:
             > "$recovery_root/immutable-recovery-evidence.json"
 
           if [ -z "$tag_sha" ]; then
-            gh api --method POST "/repos/$PUBLIC_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$RELEASE_TAG" \
-              -f sha="$snapshot_sha" >/dev/null
+            # The Git refs API rejects GITHUB_TOKEN when this snapshot's
+            # workflow tree differs from the default branch. The commit is
+            # already reachable from main, so a lightweight tag push adds no
+            # workflow change and stays within contents:write. Never force it.
+            git tag "$RELEASE_TAG" "$snapshot_sha"
+            git push origin "refs/tags/$RELEASE_TAG" ||
+              fail "failed to push the immutable tag for the authorized snapshot"
+            pushed_tag_sha="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
+            [ "$pushed_tag_sha" = "$snapshot_sha" ] ||
+              fail "immutable tag was not created at the authorized snapshot"
           fi
           rm -rf -- "$channel_worktree/channels" "$channel_worktree/manifests"
           mkdir -p "$channel_worktree/channels" "$channel_worktree/manifests"
