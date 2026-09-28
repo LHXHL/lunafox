@@ -102,7 +102,9 @@ jobs:
           original_head="$(git rev-parse --verify HEAD)"
           release_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
           head_subject="$(git log -1 --format=%s)"
-          workflow_merge_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/workflow/${release_tag//./\\.}(-retry-[0-9]+)?$"
+          # Permit the single recovery branch so later protected-main runs can
+          # traverse its workflow-only merge without treating it as source content.
+          workflow_merge_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/workflow/${release_tag//./\\.}(-retry-[0-9]+|-immutable-recovery)?$"
           workflow_generated_pattern="^chore\\(workflow\\):[[:space:]]update[[:space:]]public[[:space:]]validation[[:space:]]for[[:space:]]${release_tag//./\\.}$"
           workflow_squash_pattern="^chore\\(workflow\\):[[:space:]]update[[:space:]]public[[:space:]]validation[[:space:]]for[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
           deployment_generated_pattern="^chore\\(deploy\\):[[:space:]]finalize[[:space:]]deployment[[:space:]]snapshot[[:space:]]${release_tag//./\\.}$"
