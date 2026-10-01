@@ -48,6 +48,9 @@ var (
 	vulnerabilityResultFields = map[string]struct{}{
 		"url": {}, "vulnType": {}, "severity": {}, "source": {}, "cvssScore": {}, "description": {}, "rawOutput": {},
 	}
+	authFindingResultFields = map[string]struct{}{
+		"url": {}, "service": {}, "kind": {}, "account": {},
+	}
 )
 
 // decodeCanonicalResultObject checks the wire object before encoding/json

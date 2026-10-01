@@ -47,13 +47,36 @@ export async function getScanWorkflowProfile(id: string): Promise<ScanWorkflowPr
 }
 
 export async function createScanWorkflow(input: CreateScanWorkflowInput): Promise<ScanWorkflow> {
-  const response = await apiClient.post("/scanWorkflows", input)
+  const response = await apiClient.post("/scanWorkflows", {
+    ...input,
+    scanWorkflow: {
+      ...input.scanWorkflow,
+      stages: toMutationStages(input.scanWorkflow.stages),
+    },
+  })
   return requireWorkflow(response.data)
 }
 
 export async function updateScanWorkflow(id: string, input: UpdateScanWorkflowInput): Promise<ScanWorkflow> {
-  const response = await apiClient.patch(`/${scanWorkflowName(id)}`, input)
+  const response = await apiClient.patch(`/${scanWorkflowName(id)}`, {
+    ...input,
+    scanWorkflow: {
+      ...input.scanWorkflow,
+      stages: toMutationStages(input.scanWorkflow.stages),
+    },
+  })
   return requireWorkflow(response.data)
+}
+
+function toMutationStages(stages: ScanWorkflowStageView[]) {
+  return stages.map((stage) => ({
+    stageId: stage.stageId,
+    steps: stage.steps.map(({ stepId, engineId, profileDefaultEnabled }) => ({
+      stepId,
+      engineId,
+      profileDefaultEnabled,
+    })),
+  }))
 }
 
 function requireWorkflow(payload: unknown): ScanWorkflow {

@@ -2,6 +2,30 @@
   "schemaVersion": "lunafox-engine-image-tool-inventory/v2",
   "engines": [
     {
+      "engineId": "engine.lunafox.gogo_scan",
+      "directory": "gogo_scan",
+      "engineBinary": "gogo-scan-runtime-engine",
+      "tools": [
+        {"name": "gogo", "versionArg": "GOGO_VERSION", "version": "v2.15.0"}
+      ]
+    },
+    {
+      "engineId": "engine.lunafox.spray_scan",
+      "directory": "spray_scan",
+      "engineBinary": "spray-scan-runtime-engine",
+      "tools": [
+        {"name": "spray", "versionArg": "SPRAY_VERSION", "version": "v0.3.2"}
+      ]
+    },
+    {
+      "engineId": "engine.lunafox.zombie_audit",
+      "directory": "zombie_audit",
+      "engineBinary": "zombie-audit-runtime-engine",
+      "tools": [
+        {"name": "zombie", "versionArg": "ZOMBIE_VERSION", "version": "v1.3.0"}
+      ]
+    },
+    {
       "engineId": "engine.lunafox.directory_scan",
       "directory": "directory_scan",
       "engineBinary": "directory-scan-engine",

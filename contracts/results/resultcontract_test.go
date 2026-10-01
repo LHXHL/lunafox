@@ -22,6 +22,7 @@ func TestCanonicalDescriptorsAreStableAndComplete(t *testing.T) {
 		{ResultType: ResultKindAssetScreenshot, SchemaRef: "schema.result.asset.screenshot.v1", AuthorResultsFieldName: "Screenshots", ItemTypeName: "Screenshot", EncoderID: ResultEncoderAssetScreenshot, GoEncoderName: "EncodeScreenshot"},
 		{ResultType: ResultKindAssetDirectory, SchemaRef: "schema.result.asset.directory.v1", AuthorResultsFieldName: "Directories", ItemTypeName: "Directory", EncoderID: ResultEncoderAssetDirectory, GoEncoderName: "EncodeDirectory"},
 		{ResultType: ResultKindAssetVulnerability, SchemaRef: "schema.result.asset.vulnerability.v1", AuthorResultsFieldName: "Vulnerabilities", ItemTypeName: "Vulnerability", EncoderID: ResultEncoderAssetVulnerability, GoEncoderName: "EncodeVulnerability"},
+		{ResultType: ResultKindSecurityAuthFinding, SchemaRef: "schema.result.security.auth_finding.v1", AuthorResultsFieldName: "AuthFindings", ItemTypeName: "AuthFinding", EncoderID: ResultEncoderSecurityAuthFinding, GoEncoderName: "EncodeAuthFinding"},
 	}
 	if !reflect.DeepEqual(descriptors, want) {
 		t.Fatalf("canonical descriptors = %#v, want %#v", descriptors, want)

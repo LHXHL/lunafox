@@ -1951,6 +1951,7 @@
         "builderSubtitle": "前端编排草稿，仅支持串行阶段和阶段内并行步骤。",
         "preview": "预览",
         "save": "保存",
+        "saveFailed": "保存工作流失败",
         "publish": "发布",
         "previewTitle": "工作流预览",
         "advancedOptions": "高级选项",

@@ -1,0 +1,23 @@
+{
+  "manifestVersion": "engine.v5",
+  "engineId": "engine.lunafox.spray_scan",
+  "publisher": "lunafox",
+  "execution": {
+    "engineApiMajor": 2,
+    "supportedTargetTypes": ["domain", "ip", "cidr"],
+    "configSections": [
+      {
+        "id": "spray",
+        "defaultEnabled": true,
+        "params": [
+          {"key": "wordlist", "type": "string", "default": "dir_default.txt", "resource": {"kind": "wordlist"}},
+          {"key": "pool", "type": "integer", "default": 2, "minimum": 1, "maximum": 20},
+          {"key": "threads-per-pool", "type": "integer", "default": 10, "minimum": 1, "maximum": 100},
+          {"key": "rate-per-pool", "type": "integer", "default": 50, "minimum": 1, "maximum": 1000},
+          {"key": "request-timeout", "type": "integer", "default": 10, "minimum": 1, "maximum": 120},
+          {"key": "timeout", "type": "integer", "default": 3600, "minimum": 60, "maximum": 86400}
+        ]
+      }
+    ]
+  }
+}

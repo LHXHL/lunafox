@@ -109,6 +109,21 @@ func DecodeVulnerabilityItems(itemsJSON []string) ([]Vulnerability, error) {
 	return items, nil
 }
 
+func DecodeAuthFindingItems(itemsJSON []string) ([]AuthFinding, error) {
+	items := make([]AuthFinding, 0, len(itemsJSON))
+	for index, payload := range itemsJSON {
+		var item AuthFinding
+		if err := decodeCanonicalResultObject(payload, authFindingResultFields, &item); err != nil {
+			return nil, fmt.Errorf("itemsJson[%d] is invalid JSON: %w", index, err)
+		}
+		if err := validateAuthFinding(item); err != nil {
+			return nil, fmt.Errorf("itemsJson[%d]: %w", index, err)
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 func DecodeScreenshotItems(itemsJSON []string) ([]Screenshot, error) {
 	items := make([]Screenshot, 0, len(itemsJSON))
 	for index := range itemsJSON {

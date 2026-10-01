@@ -147,6 +147,16 @@ func newResultIngestRegistry(deps ResultIngestFacadeDependencies) resultIngestRe
 				return deps.Vulnerabilities.SaveResultBatchContext(ctx, scope.scanID, scope.targetID, items)
 			},
 		),
+		contractresults.ResultKindSecurityAuthFinding: newTypedResultIngestHandler(
+			contractresults.DecodeAuthFindingItems,
+			func(item contractresults.AuthFinding) contractresults.AuthFinding { return item },
+			func(ctx context.Context, scope resultIngestScope, items []contractresults.AuthFinding) (snapshotapp.MaterializationSummary, error) {
+				if isNilResultDependency(deps.AuthFindings) {
+					return snapshotapp.MaterializationSummary{}, ErrResultMaterializerUnavailable
+				}
+				return deps.AuthFindings.SaveResultBatchContext(ctx, scope.scanID, scope.targetID, items)
+			},
+		),
 	}}
 }
 

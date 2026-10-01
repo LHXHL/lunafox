@@ -30,6 +30,7 @@ type ResultIngestFacadeDependencies struct {
 	Directories         directoryResultMaterializer
 	Screenshots         screenshotResultMaterializer
 	Vulnerabilities     vulnerabilityResultMaterializer
+	AuthFindings        authFindingResultMaterializer
 	ScanSummary         ScanResultSummaryUpdater
 	Materialization     ResultMaterializationCoordinator
 }

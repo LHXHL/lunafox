@@ -346,6 +346,7 @@ type snapshotModuleHandlers struct {
 	hostPortSnapshotService      *snapshotservice.HostPortSnapshotFacade
 	screenshotSnapshotService    *snapshotservice.ScreenshotSnapshotFacade
 	vulnerabilitySnapshotService *snapshotservice.VulnerabilitySnapshotFacade
+	authFindingSnapshotService   *snapshotservice.AuthFindingSnapshotService
 }
 
 func buildDependencies(infra *infra, cfg *config.Config) (*deps, error) {
@@ -443,7 +444,7 @@ func buildDependencies(infra *infra, cfg *config.Config) (*deps, error) {
 	)
 	resultIngestSummary := resultingestwiring.NewResultingestScanResultSummaryUpdaterAdapter(repos.scanRepo)
 	resultIngestCoordinator := resultingestwiring.NewResultIngestMaterializationCoordinator(infra.db)
-	resultIngest := resultingestapp.NewResultIngestFacade(resultingestapp.ResultIngestFacadeDependencies{Subdomains: snapshot.subdomainSnapshotService, ScanSummary: resultIngestSummary, HostPorts: snapshot.hostPortSnapshotService, Websites: snapshot.websiteSnapshotService, WebsiteTechnologies: asset.websiteSvc, Endpoints: snapshot.endpointSnapshotService, Directories: snapshot.directorySnapshotService, Screenshots: snapshot.screenshotSnapshotService, Vulnerabilities: snapshot.vulnerabilitySnapshotService, Materialization: resultIngestCoordinator})
+	resultIngest := resultingestapp.NewResultIngestFacade(resultingestapp.ResultIngestFacadeDependencies{Subdomains: snapshot.subdomainSnapshotService, ScanSummary: resultIngestSummary, HostPorts: snapshot.hostPortSnapshotService, Websites: snapshot.websiteSnapshotService, WebsiteTechnologies: asset.websiteSvc, Endpoints: snapshot.endpointSnapshotService, Directories: snapshot.directorySnapshotService, Screenshots: snapshot.screenshotSnapshotService, Vulnerabilities: snapshot.vulnerabilitySnapshotService, AuthFindings: snapshot.authFindingSnapshotService, Materialization: resultIngestCoordinator})
 	manifestSource, err := newUpgradeManifestSource(cfg.Upgrade)
 	if err != nil {
 		return nil, fmt.Errorf("configure release manifest source: %w", err)
@@ -1046,6 +1047,7 @@ func wireSnapshotModule(
 	hostPortSnapshotSvc := snapshotwiring.NewSnapshotHostPortApplicationService(hostPortSnapshotQueryStore, hostPortSnapshotCommandStore, snapshotScanLookup, hostPortAssetSync)
 	screenshotSnapshotSvc := snapshotwiring.NewSnapshotScreenshotApplicationService(screenshotSnapshotQueryStore, screenshotSnapshotCommandStore, snapshotScanLookup, screenshotAssetSync, materializationCoordinator)
 	vulnerabilitySnapshotSvc := snapshotwiring.NewSnapshotVulnerabilityApplicationService(vulnerabilitySnapshotQueryStore, vulnerabilitySnapshotCommandStore, snapshotScanLookup, vulnerabilityAssetSync, vulnerabilityRawOutputCodec, materializationCoordinator, vulnerabilityNotificationWriter)
+	authFindingSnapshotSvc := snapshotservice.NewAuthFindingSnapshotService(snapshotrepo.NewAuthFindingSnapshotRepository(db), snapshotScanLookup)
 
 	return snapshotModuleHandlers{
 		websiteSnapshotHandler:       snapshothandler.NewWebsiteSnapshotHandler(websiteSnapshotSvc),
@@ -1062,5 +1064,6 @@ func wireSnapshotModule(
 		hostPortSnapshotService:      hostPortSnapshotSvc,
 		screenshotSnapshotService:    screenshotSnapshotSvc,
 		vulnerabilitySnapshotService: vulnerabilitySnapshotSvc,
+		authFindingSnapshotService:   authFindingSnapshotSvc,
 	}
 }

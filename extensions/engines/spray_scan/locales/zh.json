@@ -1,0 +1,17 @@
+{
+  "engine": {"displayName": "Spray 目录扫描", "description": "使用 spray 探测已发现网站的路径。"},
+  "sections": {
+    "spray": {
+      "name": "Spray",
+      "description": "配置针对网站 URL 的路径扫描。",
+      "params": {
+        "wordlist": {"description": "Server 管理的路径字典。"},
+        "pool": {"description": "spray 工作池数量。"},
+        "threads-per-pool": {"description": "每个工作池的并发线程数。"},
+        "rate-per-pool": {"description": "每个工作池的每秒最大请求数。"},
+        "request-timeout": {"description": "单请求超时，单位为秒。"},
+        "timeout": {"description": "扫描总超时，单位为秒。"}
+      }
+    }
+  }
+}

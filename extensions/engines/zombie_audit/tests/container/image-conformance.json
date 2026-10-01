@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "lunafox-engine-image-conformance-profile/v1",
+  "target": {"type": "ip", "value": "192.0.2.10"},
+  "noOpEnabledSections": ["zombie"],
+  "toolEnabledSections": ["zombie"],
+  "gateDefaultProgressAck": false,
+  "toolInputs": [
+    {"kind": "websiteURLs", "content": "http://192.0.2.10/\n"}
+  ],
+  "resultType": "security.auth_finding.v1",
+  "toolStubs": [
+    {"tool": "zombie", "source": "tool-stubs/zombie.sh"}
+  ],
+  "argvAssertions": [
+    {
+      "file": "zombie.argv",
+      "args": [
+        "-I", "-U", "/run/lunafox/resources/config/zombie/usernames/zombie-test-users.txt",
+        "-P", "/run/lunafox/resources/config/zombie/passwords/zombie-test-passwords.txt",
+        "-f", "-O", "json", "-t", "1", "--concurrency", "1", "--timeout", "5",
+        "--no-honeypot", "-q", "--no-unauth"
+      ]
+    }
+  ],
+  "sigtermTool": "zombie",
+  "platformResources": [],
+  "imageLocalProbes": []
+}

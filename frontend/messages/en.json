@@ -1951,6 +1951,7 @@
         "builderSubtitle": "Frontend draft composition, limited to serial stages and parallel steps inside a stage.",
         "preview": "Preview",
         "save": "Save",
+        "saveFailed": "Failed to save workflow",
         "publish": "Publish",
         "previewTitle": "Workflow Preview",
         "advancedOptions": "Advanced Options",

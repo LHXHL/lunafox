@@ -1,0 +1,15 @@
+{
+  "engine": {"displayName": "Gogo Port Scan", "description": "Discover open ports on target-scoped IPv4 hosts with gogo."},
+  "sections": {
+    "gogo": {
+      "name": "Gogo",
+      "description": "Configure bounded gogo port discovery.",
+      "params": {
+        "ports": {"description": "Common Gogo presets such as top2, win, db, common, and http, or explicit numeric ports and ranges. Default: top2,win,db."},
+        "threads": {"description": "Maximum concurrent gogo workers."},
+        "socket-timeout": {"description": "Per-connection timeout in seconds."},
+        "timeout": {"description": "Overall scan deadline in seconds."}
+      }
+    }
+  }
+}

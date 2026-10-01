@@ -1,0 +1,17 @@
+{
+  "engine": {"displayName": "Zombie Web 认证检测", "description": "显式启用后，使用隔离测试凭据检测 Web 认证暴露。"},
+  "sections": {
+    "zombie": {
+      "name": "Zombie",
+      "description": "启用后会真实尝试登录。普通字典只允许存放已获授权的测试凭据。",
+      "params": {
+        "usernames": {"description": "Server 管理的测试用户名字典；普通字典可被下载。"},
+        "passwords": {"description": "Server 管理的测试口令字典；不要使用生产密钥。"},
+        "timeout": {"description": "整体扫描超时，单位秒。"},
+        "request-timeout": {"description": "单次请求超时，单位秒。"},
+        "max-attempts": {"description": "所有 Web 站点合计最大用户名/口令尝试次数。"},
+        "check-anonymous": {"description": "同时检查未认证访问；仍会发生口令尝试。"}
+      }
+    }
+  }
+}

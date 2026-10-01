@@ -17,6 +17,132 @@
       "description": "Default subdomain discovery wordlist",
       "tags": ["default", "subdomain"],
       "required": true
+    },
+    {
+      "fileName": "Backup-4.2w.txt",
+      "description": "TscanPlus 备份文件路径字典（4.2w）",
+      "tags": [
+        "backup",
+        "directory"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "Backup-5.7k.txt",
+      "description": "TscanPlus 备份文件路径字典（5.7k）",
+      "tags": [
+        "backup",
+        "directory"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "admindir-1.2w.txt",
+      "description": "TscanPlus 管理后台路径字典（1.2w）",
+      "tags": [
+        "admin",
+        "directory"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "asp-2.6k.txt",
+      "description": "TscanPlus ASP 路径字典",
+      "tags": [
+        "asp",
+        "directory"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "aspx-4.8w.txt",
+      "description": "TscanPlus ASPX 路径字典（4.8w）",
+      "tags": [
+        "aspx",
+        "directory"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "dir-9.6k.txt",
+      "description": "TscanPlus 通用目录路径字典（9.6k）",
+      "tags": [
+        "common",
+        "directory"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "editor-4.5k.txt",
+      "description": "TscanPlus Web 编辑器路径字典",
+      "tags": [
+        "directory",
+        "editor"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "jsp-4.2k.txt",
+      "description": "TscanPlus JSP 路径字典",
+      "tags": [
+        "directory",
+        "jsp"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "php-3.2k.txt",
+      "description": "TscanPlus PHP 路径字典",
+      "tags": [
+        "directory",
+        "php"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "spring-0.4k.txt",
+      "description": "TscanPlus Spring Actuator 路径字典",
+      "tags": [
+        "directory",
+        "spring"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "xiaotc-phpmyadmin-6.4k.txt",
+      "description": "TscanPlus phpMyAdmin 路径字典",
+      "tags": [
+        "directory",
+        "phpmyadmin"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "xiaotc-spring-0.3k.txt",
+      "description": "TscanPlus Spring 路径字典",
+      "tags": [
+        "directory",
+        "spring"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "xiaotc-weblog-2.5k.txt",
+      "description": "TscanPlus Web 日志文件路径字典",
+      "tags": [
+        "directory",
+        "weblog"
+      ],
+      "required": true
+    },
+    {
+      "fileName": "xiaotc-wordpress-7.7k.txt",
+      "description": "TscanPlus WordPress 路径字典",
+      "tags": [
+        "directory",
+        "wordpress"
+      ],
+      "required": true
     }
   ]
 }

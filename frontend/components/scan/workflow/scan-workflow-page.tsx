@@ -24,6 +24,8 @@ import { useCreateScanWorkflow, useScanWorkflowList, useUpdateScanWorkflow } fro
 import { useEngineCatalog } from "@/hooks/use-engine-catalog"
 import { Button } from "@/components/ui/button"
 import { buildWorkflowEngineLibrary } from "@/lib/engine-catalog"
+import { getErrorMessage } from "@/lib/api-client"
+import { toastFeedback } from "@/lib/toast-helpers"
 import { COMPACT_CONTENT_GUTTER_CLASS } from "@/components/shared/layout/page-shell-density"
 import type { Locale } from "@/i18n/config"
 import type { ScanWorkflow, ScanWorkflowStageView } from "@/types/scan-workflow.types"
@@ -276,28 +278,34 @@ export default function ScanWorkflowPage() {
   }, [])
 
   const saveWorkflow = React.useCallback(async (stages: ScanWorkflowStageView[]) => {
-    if (editingWorkflow?.item) {
-      await updateWorkflow.mutateAsync({
-        id: editingWorkflow.item.name,
-        input: {
-          scanWorkflow: {
-            name: editingWorkflow.item.name,
-            displayName: draftDisplayName,
-            description: draftDescription,
-            stages,
-            etag: editingWorkflow.item.etag,
+    try {
+      if (editingWorkflow?.item) {
+        await updateWorkflow.mutateAsync({
+          id: editingWorkflow.item.name,
+          input: {
+            scanWorkflow: {
+              name: editingWorkflow.item.name,
+              displayName: draftDisplayName,
+              description: draftDescription,
+              stages,
+              etag: editingWorkflow.item.etag,
+            },
+            updateMask: ["displayName", "description", "stages"],
           },
-          updateMask: ["displayName", "description", "stages"],
-        },
-      })
-    } else {
-      await createWorkflow.mutateAsync({
-        scanWorkflow: { displayName: draftDisplayName, description: draftDescription, stages },
-        requestId: crypto.randomUUID(),
+        })
+      } else {
+        await createWorkflow.mutateAsync({
+          scanWorkflow: { displayName: draftDisplayName, description: draftDescription, stages },
+          requestId: crypto.randomUUID(),
+        })
+      }
+      setView("management")
+    } catch (error) {
+      toastFeedback.error(tWorkflow("management.saveFailed"), {
+        description: getErrorMessage(error),
       })
     }
-    setView("management")
-  }, [createWorkflow, draftDescription, draftDisplayName, editingWorkflow, updateWorkflow])
+  }, [createWorkflow, draftDescription, draftDisplayName, editingWorkflow, tWorkflow, updateWorkflow])
 
   const columns = React.useMemo(
     () => createWorkflowManagementColumns<WorkflowCatalogItem>({

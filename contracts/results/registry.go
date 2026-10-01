@@ -17,6 +17,7 @@ const (
 	ResultKindAssetScreenshot        = "asset.screenshot.v1"
 	ResultKindAssetDirectory         = "asset.directory.v1"
 	ResultKindAssetVulnerability     = "asset.vulnerability.v1"
+	ResultKindSecurityAuthFinding    = "security.auth_finding.v1"
 
 	ResultEncoderAssetSubdomain         = "asset.subdomain.v1.canonical-json"
 	ResultEncoderAssetHostPort          = "asset.host_port.v1.canonical-json"
@@ -26,6 +27,7 @@ const (
 	ResultEncoderAssetScreenshot        = "asset.screenshot.v1.canonical-json"
 	ResultEncoderAssetDirectory         = "asset.directory.v1.canonical-json"
 	ResultEncoderAssetVulnerability     = "asset.vulnerability.v1.canonical-json"
+	ResultEncoderSecurityAuthFinding    = "security.auth_finding.v1.canonical-json"
 )
 
 type Descriptor struct {
@@ -226,6 +228,14 @@ var canonicalDescriptors = [...]Descriptor{
 		EncoderID:              ResultEncoderAssetVulnerability,
 		GoEncoderName:          "EncodeVulnerability",
 	},
+	{
+		ResultType:             ResultKindSecurityAuthFinding,
+		SchemaRef:              "schema.result.security.auth_finding.v1",
+		AuthorResultsFieldName: "AuthFindings",
+		ItemTypeName:           "AuthFinding",
+		EncoderID:              ResultEncoderSecurityAuthFinding,
+		GoEncoderName:          "EncodeAuthFinding",
+	},
 }
 
 func int64Pointer(value int64) *int64      { return &value }
@@ -328,6 +338,16 @@ var canonicalCodegenDescriptors = [...]CodegenDescriptor{
 			{GoName: "CVSSScore", JSONName: "cvssScore", GoType: "*float64", Presence: FieldPresenceOptional, SchemaBasics: FieldSchemaBasics{MinNumber: numberPointer(0), MaxNumber: numberPointer(10)}},
 			{GoName: "Description", JSONName: "description", GoType: "string", Presence: FieldPresenceRequired, SchemaBasics: FieldSchemaBasics{ValidUTF8: true}},
 			{GoName: "RawOutput", JSONName: "rawOutput", GoType: "map[string]any", Presence: FieldPresenceRequired, SchemaBasics: FieldSchemaBasics{ExplicitObject: true}},
+		},
+	},
+	{
+		Descriptor:   canonicalDescriptors[8],
+		ClosedObject: true,
+		Fields: []FieldDescriptor{
+			{GoName: "URL", JSONName: "url", GoType: "string", Presence: FieldPresenceRequired, SchemaBasics: FieldSchemaBasics{ValidUTF8: true, NonEmpty: true, HTTPURL: true, NoURLUserInfo: true}},
+			{GoName: "Service", JSONName: "service", GoType: "string", Presence: FieldPresenceRequired, SchemaBasics: FieldSchemaBasics{ValidUTF8: true, NonEmpty: true, EnumValues: []string{"http", "https"}}},
+			{GoName: "Kind", JSONName: "kind", GoType: "string", Presence: FieldPresenceRequired, SchemaBasics: FieldSchemaBasics{ValidUTF8: true, NonEmpty: true, EnumValues: []string{"valid_credential", "anonymous_access"}}},
+			{GoName: "Account", JSONName: "account", GoType: "string", Presence: FieldPresenceOptional, SchemaBasics: FieldSchemaBasics{ValidUTF8: true, MaxBytes: 128}},
 		},
 	},
 }
@@ -650,6 +670,12 @@ func Validate(kind string, item any) error {
 			return fmt.Errorf("result kind %s requires results.Vulnerability item", kind)
 		}
 		return validateVulnerability(vulnerability)
+	case ResultKindSecurityAuthFinding:
+		finding, ok := item.(AuthFinding)
+		if !ok {
+			return fmt.Errorf("result kind %s requires results.AuthFinding item", kind)
+		}
+		return validateAuthFinding(finding)
 	default:
 		return fmt.Errorf("unknown result kind %q", kind)
 	}

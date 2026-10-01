@@ -1,0 +1,15 @@
+{
+  "engine": {"displayName": "Gogo 端口扫描", "description": "使用 gogo 发现目标范围内 IPv4 主机的开放端口。"},
+  "sections": {
+    "gogo": {
+      "name": "Gogo",
+      "description": "配置受限的 gogo 端口扫描。",
+      "params": {
+        "ports": {"description": "支持常用 Gogo 预设（如 top2、win、db、common、http）及数字端口或范围；默认 top2,win,db。"},
+        "threads": {"description": "gogo 的最大并发线程数。"},
+        "socket-timeout": {"description": "单连接超时，单位为秒。"},
+        "timeout": {"description": "扫描总超时，单位为秒。"}
+      }
+    }
+  }
+}

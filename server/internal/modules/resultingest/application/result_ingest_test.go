@@ -46,6 +46,17 @@ type vulnerabilityMaterializerStub struct {
 	err           error
 }
 
+type authFindingMaterializerStub struct {
+	ctx   context.Context
+	items []results.AuthFinding
+}
+
+func (stub *authFindingMaterializerStub) SaveResultBatchContext(ctx context.Context, _ int, _ int, items []results.AuthFinding) (snapshotapp.MaterializationSummary, error) {
+	stub.ctx = ctx
+	stub.items = append([]results.AuthFinding(nil), items...)
+	return snapshotapp.MaterializationSummary{ReceivedItems: len(items), SnapshotCount: int64(len(items))}, nil
+}
+
 func (stub *vulnerabilityMaterializerStub) SaveResultBatchContext(ctx context.Context, scanID int, targetID int, items []snapshotapp.VulnerabilitySnapshotItem) (snapshotapp.MaterializationSummary, error) {
 	stub.ctx = ctx
 	stub.scanID = scanID
@@ -641,6 +652,11 @@ func TestResultIngestFacadeAcceptsEveryCanonicalDescriptorWithoutEngineMembershi
 				facade = newTestResultIngestFacade(ResultIngestFacadeDependencies{Vulnerabilities: materializer, ScanSummary: summary, Materialization: coordinator})
 				observedContext = func() context.Context { return materializer.ctx }
 				item = `{"url":"https://api.example.com","vulnType":"xss","severity":"high","source":"nuclei","cvssScore":7.5,"description":"reflected XSS","rawOutput":{"template-id":"xss"}}`
+			case results.ResultKindSecurityAuthFinding:
+				materializer := &authFindingMaterializerStub{}
+				facade = newTestResultIngestFacade(ResultIngestFacadeDependencies{AuthFindings: materializer, ScanSummary: summary, Materialization: coordinator})
+				observedContext = func() context.Context { return materializer.ctx }
+				item = `{"url":"https://api.example.com/","service":"https","kind":"valid_credential","account":"test-user"}`
 			default:
 				t.Fatalf("canonical descriptor %q has no Server materialization path", descriptor.ResultType)
 			}

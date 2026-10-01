@@ -107,9 +107,6 @@ const canvasCatalogProps = {
 
 describe("WorkflowCompositionCanvas", () => {
   it("auto-layouts and focuses stages when the canvas is opened", async () => {
-    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-      matches: query === "(min-width: 768px)",
-    }) as MediaQueryList)
     getViewportForBoundsMock.mockClear()
     setViewportMock.mockClear()
 
@@ -121,7 +118,7 @@ describe("WorkflowCompositionCanvas", () => {
     expect(container.querySelector('[data-flow-node-id="stage-2"]')).toHaveAttribute("data-flow-node-position", "400,56")
     expect(getViewportForBoundsMock).toHaveBeenCalledWith(
       { x: 0, y: 0, width: 400, height: 120 },
-      896,
+      1200,
       800,
       0.4,
       1,
@@ -131,9 +128,6 @@ describe("WorkflowCompositionCanvas", () => {
 
   it("auto-layouts stages with room for curved serial connectors", async () => {
     const { container } = renderWithProviders(<WorkflowCompositionCanvas {...canvasCatalogProps} />)
-    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-      matches: query === "(min-width: 768px)",
-    }) as MediaQueryList)
     getViewportForBoundsMock.mockClear()
     setViewportMock.mockClear()
 
@@ -145,13 +139,13 @@ describe("WorkflowCompositionCanvas", () => {
     expect(container.querySelector('[data-flow-node-id="stage-2"]')).toHaveAttribute("data-flow-node-position", "400,56")
     expect(getViewportForBoundsMock).toHaveBeenCalledWith(
       { x: 0, y: 0, width: 400, height: 120 },
-      896,
+      1200,
       800,
       0.4,
       1,
       0.16,
     )
-    expect(setViewportMock).toHaveBeenCalledWith({ x: 404, y: 200, zoom: 1 }, { duration: 200 })
+    expect(setViewportMock).toHaveBeenCalledWith({ x: 100, y: 200, zoom: 1 }, { duration: 200 })
   })
 
   it("retains a dragged stage position after stage data changes", async () => {
@@ -235,6 +229,8 @@ describe("WorkflowCompositionCanvas", () => {
     expect(container.querySelector('[data-engine-unavailable="true"]')).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "close" }))
     await waitFor(() => expect(screen.getByRole("button", { name: "management.save" })).toBeVisible())
+    expect(screen.getByRole("button", { name: "management.save" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "Custom EngineCustom engine description" }))
     expect(screen.getByRole("button", { name: "management.save" })).toBeEnabled()
   })
 
@@ -266,6 +262,15 @@ describe("WorkflowCompositionCanvas", () => {
         })],
       }),
     ]))
+    expect(onSave.mock.calls[0][0]).toHaveLength(1)
+  })
+
+  it("does not save a draft without any engine", () => {
+    const onSave = vi.fn()
+    renderWithProviders(<WorkflowCompositionCanvas {...canvasCatalogProps} displayName="Empty" onSave={onSave} />)
+
+    expect(screen.getByRole("button", { name: "management.save" })).toBeDisabled()
+    expect(onSave).not.toHaveBeenCalled()
   })
 
   it("collects metadata in a dialog before the first save", () => {
@@ -289,6 +294,7 @@ describe("WorkflowCompositionCanvas", () => {
     renderWithProviders(<WorkflowCanvasWithMetadata />)
 
     expect(screen.queryByRole("textbox", { name: "canvas.workflowName" })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Custom EngineCustom engine description" }))
     fireEvent.click(screen.getByRole("button", { name: "management.save" }))
 
     expect(screen.getByRole("heading", { name: "canvas.saveMetadataTitle" })).toBeInTheDocument()

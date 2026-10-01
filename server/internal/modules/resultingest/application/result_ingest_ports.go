@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 
+	contractresults "github.com/yyhuni/lunafox/contracts/results"
 	assetapp "github.com/yyhuni/lunafox/server/internal/modules/asset/application"
 	snapshotapp "github.com/yyhuni/lunafox/server/internal/modules/snapshot/application"
 )
@@ -37,6 +38,10 @@ type screenshotResultMaterializer interface {
 
 type vulnerabilityResultMaterializer interface {
 	SaveResultBatchContext(context.Context, int, int, []snapshotapp.VulnerabilitySnapshotItem) (snapshotapp.MaterializationSummary, error)
+}
+
+type authFindingResultMaterializer interface {
+	SaveResultBatchContext(context.Context, int, int, []contractresults.AuthFinding) (snapshotapp.MaterializationSummary, error)
 }
 
 // ScanResultSummaryUpdater refreshes backend-owned read-model counters after result materialization.

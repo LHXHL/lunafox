@@ -1,0 +1,21 @@
+{
+  "manifestVersion": "engine.v5",
+  "engineId": "engine.lunafox.gogo_scan",
+  "publisher": "lunafox",
+  "execution": {
+    "engineApiMajor": 2,
+    "supportedTargetTypes": ["domain", "ip", "cidr"],
+    "configSections": [
+      {
+        "id": "gogo",
+        "defaultEnabled": true,
+        "params": [
+          {"key": "ports", "type": "string", "default": "top1"},
+          {"key": "threads", "type": "integer", "default": 100, "minimum": 1, "maximum": 1000},
+          {"key": "socket-timeout", "type": "integer", "default": 2, "minimum": 1, "maximum": 30},
+          {"key": "timeout", "type": "integer", "default": 14400, "minimum": 60, "maximum": 86400}
+        ]
+      }
+    ]
+  }
+}

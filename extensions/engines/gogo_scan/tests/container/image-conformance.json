@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "lunafox-engine-image-conformance-profile/v1",
+  "target": {"type": "ip", "value": "192.0.2.10"},
+  "noOpEnabledSections": ["gogo"],
+  "toolEnabledSections": ["gogo"],
+  "gateDefaultProgressAck": false,
+  "toolInputs": [],
+  "resultType": "asset.host_port.v1",
+  "toolStubs": [
+    {"tool": "gogo", "source": "tool-stubs/gogo.sh"}
+  ],
+  "argvAssertions": [
+    {
+      "file": "gogo.argv",
+      "args": ["-i", "192.0.2.10", "-p", "top1", "-t", "100", "-d", "2", "-D", "2", "-O", "jl", "-C", "-q"]
+    }
+  ],
+  "sigtermTool": "gogo",
+  "platformResources": [],
+  "imageLocalProbes": []
+}

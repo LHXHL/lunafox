@@ -1,0 +1,52 @@
+{
+  "scanWorkflowId": "chainreactor",
+  "displayName": "ChainReactor Scan",
+  "description": "Discover subdomains, scan ports and services with gogo, identify websites, then probe web paths with spray. Zombie credential assessment is opt-in.",
+  "stages": [
+    {
+      "stageId": "discovery",
+      "steps": [
+        {
+          "stepId": "subdomain_discovery",
+          "engineId": "engine.lunafox.subdomain_discovery",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "network",
+      "steps": [
+        {
+          "stepId": "gogo_scan",
+          "engineId": "engine.lunafox.gogo_scan",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "websites",
+      "steps": [
+        {
+          "stepId": "website_discovery",
+          "engineId": "engine.lunafox.website_discovery",
+          "profileDefaultEnabled": true
+        }
+      ]
+    },
+    {
+      "stageId": "deep_probe",
+      "steps": [
+        {
+          "stepId": "spray_scan",
+          "engineId": "engine.lunafox.spray_scan",
+          "profileDefaultEnabled": true
+        },
+        {
+          "stepId": "zombie_audit",
+          "engineId": "engine.lunafox.zombie_audit",
+          "profileDefaultEnabled": false
+        }
+      ]
+    }
+  ]
+}

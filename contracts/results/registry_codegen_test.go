@@ -7,8 +7,8 @@ func TestCodegenDescriptorsExposeCanonicalOrderAndFieldMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CodegenDescriptors() error = %v", err)
 	}
-	if len(descriptors) != 8 {
-		t.Fatalf("CodegenDescriptors() returned %d descriptors, want 8", len(descriptors))
+	if len(descriptors) != 9 {
+		t.Fatalf("CodegenDescriptors() returned %d descriptors, want 9", len(descriptors))
 	}
 	wantTypes := []string{
 		ResultKindAssetSubdomain,
@@ -19,6 +19,7 @@ func TestCodegenDescriptorsExposeCanonicalOrderAndFieldMetadata(t *testing.T) {
 		ResultKindAssetScreenshot,
 		ResultKindAssetDirectory,
 		ResultKindAssetVulnerability,
+		ResultKindSecurityAuthFinding,
 	}
 	for index, want := range wantTypes {
 		if descriptors[index].ResultType != want {

@@ -1,0 +1,17 @@
+{
+  "engine": {"displayName": "Spray Directory Scan", "description": "Discover paths on finalized websites with spray."},
+  "sections": {
+    "spray": {
+      "name": "Spray",
+      "description": "Configure path discovery against website URLs.",
+      "params": {
+        "wordlist": {"description": "Server-managed path wordlist."},
+        "pool": {"description": "Number of spray worker pools."},
+        "threads-per-pool": {"description": "Concurrent workers in each pool."},
+        "rate-per-pool": {"description": "Maximum requests per second in each pool."},
+        "request-timeout": {"description": "Per-request timeout in seconds."},
+        "timeout": {"description": "Overall scan deadline in seconds."}
+      }
+    }
+  }
+}

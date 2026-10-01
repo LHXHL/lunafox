@@ -1,6 +1,10 @@
 package workflowmanifest
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestListManifests(t *testing.T) {
 	items, err := ListManifests()
@@ -44,6 +48,33 @@ func TestGetManifest(t *testing.T) {
 	}
 	if manifest.ScanWorkflowID != "default" {
 		t.Fatalf("unexpected scanWorkflowId: %q", manifest.ScanWorkflowID)
+	}
+}
+
+func TestChainReactorWorkflowTopology(t *testing.T) {
+	payload, err := os.ReadFile(filepath.Join(repoRootForTest(), "extensions", "workflows", "chainreactor.scan-workflow.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := decodeManifest(payload, "chainreactor.scan-workflow.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManifest(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Stages) != 4 {
+		t.Fatalf("expected four stages, got %+v", manifest.Stages)
+	}
+	wantStages := []string{"discovery", "network", "websites", "deep_probe"}
+	for i, want := range wantStages {
+		if manifest.Stages[i].StageID != want {
+			t.Fatalf("stage %d: got %q, want %q", i, manifest.Stages[i].StageID, want)
+		}
+	}
+	steps := manifest.Stages[3].Steps
+	if len(steps) != 2 || steps[0].EngineID != "engine.lunafox.spray_scan" || steps[1].EngineID != "engine.lunafox.zombie_audit" || steps[1].ProfileDefaultEnabled {
+		t.Fatalf("unexpected deep probe defaults: %+v", steps)
 	}
 }
 

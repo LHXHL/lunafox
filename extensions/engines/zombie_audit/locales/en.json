@@ -1,0 +1,17 @@
+{
+  "engine": {"displayName": "Zombie Web Auth Audit", "description": "Explicitly enabled Web authentication checks with isolated test credentials."},
+  "sections": {
+    "zombie": {
+      "name": "Zombie",
+      "description": "This Engine makes real login attempts when enabled. Use only approved test credentials in ordinary wordlists.",
+      "params": {
+        "usernames": {"description": "Server-managed test username wordlist; ordinary wordlists are downloadable."},
+        "passwords": {"description": "Server-managed test password wordlist; do not use production secrets."},
+        "timeout": {"description": "Overall scan deadline in seconds."},
+        "request-timeout": {"description": "Per-request timeout in seconds."},
+        "max-attempts": {"description": "Maximum candidate username/password attempts across Web origins."},
+        "check-anonymous": {"description": "Also check unauthenticated access; login attempts still occur."}
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "manifestVersion": "engine.v5",
+  "engineId": "engine.lunafox.zombie_audit",
+  "publisher": "lunafox",
+  "execution": {
+    "engineApiMajor": 2,
+    "supportedTargetTypes": ["domain", "ip", "cidr"],
+    "configSections": [
+      {
+        "id": "zombie",
+        "defaultEnabled": true,
+        "params": [
+          {"key": "timeout", "type": "integer", "default": 900, "minimum": 60, "maximum": 3600},
+          {"key": "request-timeout", "type": "integer", "default": 5, "minimum": 1, "maximum": 30},
+          {"key": "max-attempts", "type": "integer", "default": 100, "minimum": 1, "maximum": 1000},
+          {"key": "check-anonymous", "type": "boolean", "default": false}
+        ]
+      }
+    ]
+  }
+}

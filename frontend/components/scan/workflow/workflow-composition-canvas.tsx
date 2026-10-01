@@ -97,9 +97,6 @@ type StageNodeData = {
 type WorkflowStageNode = Node<StageNodeData, "workflowStage">
 type WorkflowTranslator = ReturnType<typeof useTranslations>
 
-// Desktop auto-layout centers within the area not obscured by the floating engine library.
-const WORKFLOW_ENGINE_LIBRARY_OCCLUSION_PX = 304
-
 const nodeTypes = {
   workflowStage: WorkflowStageNode,
 }
@@ -371,7 +368,7 @@ function buildGraph({
 }
 
 function toScanWorkflowStages(stages: DraftStage[]): ScanWorkflowStageView[] {
-  return stages.map((stage) => ({
+  return stages.filter((stage) => stage.steps.length > 0).map((stage) => ({
     stageId: stage.id,
     steps: stage.steps.map((step) => ({
       stageId: stage.id,
@@ -473,7 +470,9 @@ export function WorkflowCompositionCanvas({
   const hasUnavailableEngine = draftStages.some((stage) => (
     stage.steps.some((step) => !enginesById.has(step.engineId))
   ))
-  const canSave = engineCatalogStatus === "ready" && !hasUnavailableEngine
+  const canSave = engineCatalogStatus === "ready"
+    && !hasUnavailableEngine
+    && draftStages.some((stage) => stage.steps.length > 0)
 
   const addStepToStage = React.useCallback((stageId: string, engineId: string) => {
     if (readOnly || engineCatalogStatus !== "ready") return
@@ -641,12 +640,19 @@ export function WorkflowCompositionCanvas({
 
   return (
     <section
-      className={cn("relative flex h-full min-h-0 flex-1 overflow-hidden", styles.workbench, className)}
+      className={cn("relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden md:flex-row", styles.workbench, className)}
       data-workflow-composition-canvas="mock-only"
-      data-workflow-builder="floating-canvas"
+      data-workflow-builder="docked-canvas"
       data-workspace-width="full"
     >
-      <div className={cn("absolute inset-0", styles.canvasShell)} data-workflow-builder-canvas="serial-parallel">
+      {!readOnly ? (
+        <EngineLibraryPanel
+          engines={engines}
+          status={engineCatalogStatus}
+          onEngineClick={(engineId) => addStepToStage(selectedStage?.id ?? selectedStageId, engineId)}
+        />
+      ) : null}
+      <div className={cn("relative min-h-0 min-w-0 flex-1", styles.canvasShell)} data-workflow-builder-canvas="serial-parallel">
         <ReactFlow
           nodes={flowNodes}
           edges={graph.edges}
@@ -661,8 +667,6 @@ export function WorkflowCompositionCanvas({
           zoomOnDoubleClick={false}
           minZoom={WORKFLOW_CANVAS_MIN_ZOOM}
           maxZoom={WORKFLOW_CANVAS_MAX_ZOOM}
-          fitView
-          fitViewOptions={{ padding: 0.16, maxZoom: 1 }}
           proOptions={{ hideAttribution: true }}
         >
           <Background gap={24} size={1.5} />
@@ -684,19 +688,12 @@ export function WorkflowCompositionCanvas({
             isSaving={isSaving}
           />
         </ReactFlow>
-      </div>
-      <WorkflowCanvasHeader
-        backLabel={backLabel ?? t("management.backToList")}
-        onBack={onBack}
-        displayName={displayName}
-      />
-      {!readOnly ? (
-        <EngineLibraryPanel
-          engines={engines}
-          status={engineCatalogStatus}
-          onEngineClick={(engineId) => addStepToStage(selectedStage?.id ?? selectedStageId, engineId)}
+        <WorkflowCanvasHeader
+          backLabel={backLabel ?? t("management.backToList")}
+          onBack={onBack}
+          displayName={displayName}
         />
-      ) : null}
+      </div>
       <WorkflowStageInspector
         open={stageInspectorOpen}
         stage={selectedStage}
@@ -868,20 +865,15 @@ function WorkflowCanvasActions({
   React.useEffect(() => {
     if (layoutVersion === 0 || canvasWidth === 0 || canvasHeight === 0) return
 
-    const libraryOcclusion = window.matchMedia("(min-width: 768px)").matches
-      ? WORKFLOW_ENGINE_LIBRARY_OCCLUSION_PX
-      : 0
     const viewport = getViewportForBounds(
       getNodesBounds(getNodes()),
-      canvasWidth - libraryOcclusion,
+      canvasWidth,
       canvasHeight,
       WORKFLOW_CANVAS_MIN_ZOOM,
       1,
       0.16,
     )
 
-    // The usable area starts after the desktop engine library, so calculate and apply one final viewport.
-    viewport.x += libraryOcclusion
     void setViewport(viewport, { duration: 200 })
   }, [canvasHeight, canvasWidth, getNodes, getNodesBounds, layoutVersion, setViewport])
 
@@ -1104,7 +1096,7 @@ function EngineLibraryPanel({
   const t = useTranslations("scan.workflow")
 
   return (
-    <aside className={cn("flex min-h-0 flex-col overflow-hidden", styles.floatingEnginePanel)} data-engine-library="workflow-builder">
+    <aside className={cn("flex min-h-0 flex-col overflow-hidden", styles.engineLibraryPanel)} data-engine-library="workflow-builder">
       <div className="border-b p-4">
         <div className="flex items-center justify-between gap-3">
           <h2 className={textRole.sectionTitle}>{t("canvas.engineLibrary")}</h2>

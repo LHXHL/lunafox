@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const apiClientMocks = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), patch: vi.fn() }))
 vi.mock("@/lib/api-client", () => ({ default: apiClientMocks }))
 
-import { getScanWorkflow, getScanWorkflowProfile, listScanWorkflows } from "@/services/scan-workflow.service"
+import { createScanWorkflow, getScanWorkflow, getScanWorkflowProfile, listScanWorkflows, updateScanWorkflow } from "@/services/scan-workflow.service"
 
 const workflow = {
   name: "scanWorkflows/default",
@@ -52,5 +52,30 @@ describe("scan-workflow.service catalog contract", () => {
       },
     })
     await expect(getScanWorkflow("default")).rejects.toThrow(/pure orchestration topology/)
+  })
+
+  it("保存时只提交服务端允许的 Step 字段", async () => {
+    apiClientMocks.post.mockResolvedValue({ data: workflow })
+    apiClientMocks.patch.mockResolvedValue({ data: workflow })
+    const stages = [{
+      stageId: "discovery",
+      steps: [{ stageId: "discovery", stepId: "discover", engineId: "engine.lunafox.discovery", profileDefaultEnabled: true }],
+    }]
+
+    await createScanWorkflow({
+      scanWorkflow: { displayName: "Test", description: "", stages },
+      requestId: "00000000-0000-4000-8000-000000000001",
+    })
+    await updateScanWorkflow("default", {
+      scanWorkflow: { name: "scanWorkflows/default", displayName: "Test", description: "", stages, etag: "etag-1" },
+      updateMask: ["displayName", "description", "stages"],
+    })
+
+    const expectedStages = [{
+      stageId: "discovery",
+      steps: [{ stepId: "discover", engineId: "engine.lunafox.discovery", profileDefaultEnabled: true }],
+    }]
+    expect(apiClientMocks.post.mock.calls[0][1].scanWorkflow.stages).toEqual(expectedStages)
+    expect(apiClientMocks.patch.mock.calls[0][1].scanWorkflow.stages).toEqual(expectedStages)
   })
 })

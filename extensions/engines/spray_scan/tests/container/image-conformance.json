@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "lunafox-engine-image-conformance-profile/v1",
+  "target": {"type": "ip", "value": "192.0.2.10"},
+  "noOpEnabledSections": ["spray"],
+  "toolEnabledSections": ["spray"],
+  "gateDefaultProgressAck": false,
+  "toolInputs": [
+    {"kind": "websiteURLs", "content": "http://192.0.2.10/\n"}
+  ],
+  "resultType": "asset.directory.v1",
+  "toolStubs": [
+    {"tool": "spray", "source": "tool-stubs/spray.sh"}
+  ],
+  "argvAssertions": [
+    {
+      "file": "spray.argv",
+      "args": [
+        "-l", "/run/lunafox/inputs/website-urls.txt",
+        "-d", "/run/lunafox/resources/config/spray/wordlist/dir_default.txt",
+        "-m", "path", "-O", "json", "--no-bar", "--no-stat", "-q",
+        "--rate-limit", "50", "-P", "2", "-t", "10", "-T", "10", "--deadline", "3600"
+      ]
+    }
+  ],
+  "sigtermTool": "spray",
+  "platformResources": [],
+  "imageLocalProbes": []
+}

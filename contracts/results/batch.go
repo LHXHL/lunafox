@@ -153,6 +153,8 @@ func ValidateCanonicalBatch(resultType string, items [][]byte, limits BatchLimit
 		_, err = DecodeDirectoryItems(itemsJSON)
 	case ResultKindAssetVulnerability:
 		_, err = DecodeVulnerabilityItems(itemsJSON)
+	case ResultKindSecurityAuthFinding:
+		_, err = DecodeAuthFindingItems(itemsJSON)
 	default:
 		// Lookup above makes this unreachable, but keep the switch closed so a
 		// newly added descriptor cannot accidentally bypass schema validation.
