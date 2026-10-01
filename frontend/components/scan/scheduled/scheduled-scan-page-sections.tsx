@@ -172,8 +172,9 @@ export function ScheduledScanTimeline({
                     </span>
                     {index === 0 ? (
                       <Badge
+                        size="compact"
                         variant="secondary"
-                        className="bg-info/10 px-2 py-0 text-info hover:bg-info/10"
+                        className="bg-info/10 text-info hover:bg-info/10"
                       >
                         {labels.soon}
                       </Badge>
@@ -317,6 +318,15 @@ export function ScheduledScanDataTableLoadingState({
       success: tColumns("scheduledScan.success"),
       failure: tColumns("scheduledScan.failure"),
       lastRun: tColumns("scheduledScan.lastRun"),
+      lastFailure: tColumns("scheduledScan.lastFailure"),
+      failureCauses: {
+        WORKFLOW_UNAVAILABLE: tColumns("scheduledScan.failureCauses.WORKFLOW_UNAVAILABLE"),
+        AGENT_NOT_FOUND: tColumns("scheduledScan.failureCauses.AGENT_NOT_FOUND"),
+        CONFIG_RESOURCE_UNAVAILABLE: tColumns("scheduledScan.failureCauses.CONFIG_RESOURCE_UNAVAILABLE"),
+        ENGINE_UNAVAILABLE: tColumns("scheduledScan.failureCauses.ENGINE_UNAVAILABLE"),
+        TARGET_UNAVAILABLE: tColumns("scheduledScan.failureCauses.TARGET_UNAVAILABLE"),
+        INTERNAL_UNAVAILABLE: tColumns("scheduledScan.failureCauses.INTERNAL_UNAVAILABLE"),
+      },
     },
     actions: {
       editTask: tScan("editTask"),

@@ -158,6 +158,7 @@ const REQUIRED_PUBLIC_RUNTIME_EXACT = [
   "scripts/ci/verify-public-runtime-source.sh",
   "scripts/ci/check-migration-baseline-policy.mjs",
   "scripts/ci/check-engine-api-major-policy.mjs",
+  "scripts/ci/resolve-release-migration-metadata.mjs",
   "scripts/ci/publish-engine-runtime-images.sh",
   "scripts/ci/aggregate-engine-runtime-image-shards.sh",
   "scripts/ci/check-engine-image-tool-inventory.mjs",
@@ -189,15 +190,39 @@ const REQUIRED_PUBLIC_DOCUMENTATION_PATHS = [
   "scripts/ci/validate-public-documentation.mjs",
   "scripts/ci/validate-public-documentation.test.mjs",
 ];
+const REQUIRED_PUBLIC_CLOUDFLARE_WORKER_EXACT = [
+  "tools/lunafox-ghcr-registry/.gitignore",
+  "tools/lunafox-ghcr-registry/README.md",
+  "tools/lunafox-ghcr-registry/package.json",
+  "tools/lunafox-ghcr-registry/pnpm-lock.yaml",
+  "tools/lunafox-ghcr-registry/tsconfig.json",
+  "tools/lunafox-ghcr-registry/tsconfig.test.json",
+  "tools/lunafox-ghcr-registry/wrangler.jsonc",
+  "tools/lunafox-ghcr-registry/src/registry.ts",
+  "tools/lunafox-ghcr-registry/src/worker.ts",
+  "tools/lunafox-ghcr-registry/test/worker.test.ts",
+  "tools/lunafox-ghcr-registry/scripts/verify-local-registry.sh",
+  "scripts/ci/verify-cloudflare-worker-release.mjs",
+  "scripts/ci/verify-cloudflare-worker-release.test.mjs",
+];
+const REQUIRED_PUBLIC_CLOUDFLARE_WORKER_PREFIXES = [
+  "tools/lunafox-ghcr-registry/src/",
+  "tools/lunafox-ghcr-registry/test/",
+  "tools/lunafox-ghcr-registry/scripts/",
+];
 const DESTINATION_DEPLOYMENT_PATHS = [
   ".env",
   ".env.example",
   "compose.yaml",
   "engine-inventory.yaml",
   "release.manifest.yaml",
+  "third-party-image-policy.json",
 ];
+const LEGACY_DEPLOYMENT_PATHS = DESTINATION_DEPLOYMENT_PATHS.filter((path) => path !== "third-party-image-policy.json");
 const OPTIONAL_DESTINATION_OWNED_PATHS = [
+  "third-party-image-policy.json",
   "runtime-composition.json",
+  "preheat-manifest.json",
 ];
 const PUBLISHED_MANIFESTS_WITHOUT_COMPOSITION = [
   "541e57adcb95c8557fe5783fc563282fb17cbc563e0e21ef48847121504618ab",
@@ -333,7 +358,7 @@ function assertLegacyDeploymentBootstrapPolicy(policy) {
       bootstrap?.packageName !== "lunafox-v0.0.1-alpha.114-dockerhub.zip" ||
       bootstrap?.sha256 !== "d02fe6f9da2576e3a89b52d38a03b5af6afd91670de26e67fe1f1efcf809c55c" ||
       bootstrap?.manifestSha256 !== "e0e742054888daf0fb6482be721c82bd8e162d795143badbf2089cbd978c5e8b" ||
-      JSON.stringify(bootstrap?.paths) !== JSON.stringify(DESTINATION_DEPLOYMENT_PATHS)) {
+      JSON.stringify(bootstrap?.paths) !== JSON.stringify(LEGACY_DEPLOYMENT_PATHS)) {
     fail("legacy public deployment bootstrap must remain pinned to the verified alpha.114 Docker Hub package");
   }
   if (JSON.stringify(policy.publishedManifestsWithoutComposition) !== JSON.stringify(PUBLISHED_MANIFESTS_WITHOUT_COMPOSITION)) {
@@ -815,9 +840,124 @@ function assertPublicWorkflow(workflow, policy) {
   const contextValidation = jobBlock(workflow, "validate-runtime-contexts");
   const aggregate = jobBlock(workflow, "public-validation");
   const publicationIntent = jobBlock(workflow, "publication-intent");
+  const immutableRecovery = jobBlock(workflow, "recover-immutable-public-release");
   const runtimeCompositionResolver = jobBlock(workflow, "resolve-public-runtime-composition");
   const publication = jobBlock(workflow, "publish-runtime-images");
   const agentPublication = jobBlock(workflow, "publish-agent-image");
+  const workflowDispatch = workflow.slice(0, workflow.indexOf("\npermissions:"));
+  if (!workflowDispatch.includes("workflow_dispatch:\n    inputs:") ||
+      !workflowDispatch.includes("      publish:") ||
+      !workflowDispatch.includes("        type: boolean") ||
+      !workflowDispatch.includes("      release_tag:") ||
+      !workflowDispatch.includes("        type: string")) {
+    fail("public workflow must define explicit immutable recovery inputs");
+  }
+  const dispatchGateStart = publicationIntent.indexOf('if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then');
+  const dispatchGateEnd = dispatchGateStart < 0 ? -1 : publicationIntent.indexOf("\n          fi", dispatchGateStart);
+  const dispatchGate = dispatchGateStart < 0 || dispatchGateEnd < 0
+    ? ""
+    : publicationIntent.slice(dispatchGateStart, dispatchGateEnd);
+  for (const required of [
+    '[ "$GITHUB_REF" = refs/heads/main ] || exit 0',
+    '[ "$DISPATCH_PUBLISH" = true ] || exit 0',
+    '[ "$DISPATCH_RELEASE_TAG" = "$release_tag" ] || {',
+    "manual recovery Tag must exactly match PUBLIC_PROVENANCE.json",
+  ]) {
+    if (!dispatchGate.includes(required)) fail(`public immutable recovery gate is missing: ${required}`);
+  }
+  for (const required of [
+    "recovery: ${{ steps.intent.outputs.recovery }}",
+    'echo "recovery=false" >> "$GITHUB_OUTPUT"',
+    'echo "recovery=true" >> "$GITHUB_OUTPUT"',
+  ]) {
+    if (!publicationIntent.includes(required)) fail(`public immutable recovery intent is missing: ${required}`);
+  }
+  if (!hasRequiredJobNeeds(immutableRecovery, ["publication-intent", "public-validation"]) ||
+      !jobCondition(immutableRecovery).includes("needs.publication-intent.outputs.recovery == 'true'") ||
+      !jobCondition(immutableRecovery).includes("needs.public-validation.result == 'success'") ||
+      !immutableRecovery.includes("environment: public-release")) {
+    fail("immutable public release recovery must run only after protected intent and successful public validation");
+  }
+  assertGitHubHostedRunner(immutableRecovery, "immutable public release recovery");
+  if (!/permissions:\s*\n\s+actions:\s+write\n\s+contents:\s+write\n\s+pull-requests:\s+read\s*$/m.test(immutableRecovery) ||
+      /packages:\s*write|id-token:\s*write|attestations:\s*write|docker\/login-action|oras login|oras cp|cosign sign|docker (?:build|push)|publish-public-deployment\.mjs|\bsecrets\./.test(immutableRecovery)) {
+    fail("immutable public release recovery must retain only terminal metadata authority and no OCI publication authority");
+  }
+  for (const required of [
+    "fetch-depth: 0",
+    "git worktree add --detach",
+    "git diff-tree --no-commit-id --name-only -r",
+    "snapshot-pull-request.json",
+    "snapshot pull request is not the authorized protected-main merge",
+    "PUBLIC_PROVENANCE.json",
+    "PUBLIC_EXPORT_MANIFEST.json",
+    "public-validation has already verified the source-export history",
+    "verify-public-release.mjs",
+    "verify-release-component-composition.mjs",
+    "verify-public-deployment.sh",
+    "generate-compose-deployment.mjs",
+    "generated deployment closure differs from the authorized snapshot",
+    "anonymous-registry",
+    "oras manifest fetch",
+    '"$RUNNER_TEMP/verify-immutable-recovery-signature" "$ref"',
+    "DOCKER_CONFIG=\"$anonymous_config\" cosign verify",
+    "verify-runtime-image-index.mjs",
+    "immutable-recovery-evidence.json",
+    "existing immutable release-channel record conflicts",
+    "existing immutable tag points to a different commit",
+    "existing GitHub Release metadata conflicts",
+    "existing Release asset conflicts",
+    "gh release create",
+    "gh release upload",
+    "immutable-public-release-recovery-${{ github.run_id }}",
+  ]) {
+    if (!immutableRecovery.includes(required)) fail(`immutable public release recovery is missing: ${required}`);
+  }
+  for (const required of [
+    'channel_current_root="$recovery_root/channel-current"',
+    "current_channel_files=(",
+    '"channels/$channel.env"',
+    '"${immutable_channel_files[@]}"',
+    'mkdir -p "$(dirname "$channel_current_root/$relative")"',
+    'cp "$channel_root/$relative" "$channel_current_root/$relative"',
+    '--root-dir "$channel_current_root"',
+  ]) {
+    if (!immutableRecovery.includes(required)) {
+      fail(`immutable public release recovery must validate only the generated current channel records before preserving history: ${required}`);
+    }
+  }
+  if (immutableRecovery.includes('--root-dir "$channel_root"')) {
+    fail("immutable public release recovery must not validate unrelated historical channel records");
+  }
+  if (!immutableRecovery.includes('git tag "$RELEASE_TAG" "$snapshot_sha"') ||
+      !immutableRecovery.includes('git push origin "refs/tags/$RELEASE_TAG"') ||
+      immutableRecovery.includes('"/repos/$PUBLIC_REPOSITORY/git/refs"')) {
+    fail("immutable public release recovery must push an absent tag at the authorized snapshot instead of using the Git refs API");
+  }
+  if (immutableRecovery.includes("gh release edit") ||
+      immutableRecovery.includes('--provenance "$snapshot_root/PUBLIC_PROVENANCE.json"') ||
+      !immutableRecovery.includes('if: always()\n        uses: actions/upload-artifact@v4')) {
+    fail("immutable public release recovery must preserve exact existing metadata, provenance boundary, and upload verification evidence");
+  }
+  const ordinaryReleaseJobs = [
+    "resolve-public-runtime-composition",
+    "publish-runtime-images",
+    "publish-agent-image",
+    "public-engine-runtime-discover",
+    "public-engine-runtime-build",
+    "public-engine-runtime-finalize",
+    "public-engine-runtime-aggregate",
+    "public-engine-runtime-sign",
+    "public-engine-package-build",
+    "public-engine-package-publish",
+    "public-engine-release-manifest",
+    "publish-final-release",
+  ];
+  for (const name of ordinaryReleaseJobs) {
+    if (!jobBlock(workflow, name).includes("needs.publication-intent.outputs.recovery != 'true'")) {
+      fail(`ordinary release job must be skipped during immutable recovery: ${name}`);
+    }
+  }
   const validationBlocks = [validation, frontendValidation, scopeValidation, goValidation, protoValidation, contextValidation, aggregate, publicationIntent];
   validationBlocks.forEach((block, index) => {
     const label = `public validation job ${index + 1}`;
@@ -833,6 +973,27 @@ function assertPublicWorkflow(workflow, policy) {
   });
   if (!validation.includes("ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}")) {
     fail("public export validation must check the real PR head commit instead of GitHub's synthetic merge commit");
+  }
+  if (!hasRequiredJobNeeds(validation, ["publication-intent"])) {
+    fail("public export validation must wait for provenance-bound publication intent");
+  }
+  const recoveryHistoryValidation = withoutComments(workflowStepBlock(
+    validation,
+    "      - name: Verify exact exported file manifest and immutable Agent bundle",
+  ));
+  for (const required of [
+    "RECOVERY_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && needs.publication-intent.outputs.publish == 'true' }}",
+    'if [ "$RECOVERY_PUBLISH" = true ]; then',
+    'recovery_base="$(git rev-parse --verify HEAD^1)"',
+    'recovery_parent="$(git rev-parse --verify HEAD^2)"',
+    'workflow_merge_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/workflow/${release_tag//./\\\\.}(-retry-[0-9]+|-immutable-recovery)?$"',
+    '[ "$(git diff --name-only "$recovery_base" "$recovery_parent")" = ".github/workflows/public-validate.yml" ] || {',
+    'git diff --quiet "$recovery_parent" HEAD',
+    'git checkout --detach "$recovery_parent"',
+  ]) {
+    if (!recoveryHistoryValidation.includes(required)) {
+      fail(`public export recovery must bind its parent-history check: ${required}`);
+    }
   }
   assertGitHubHostedRunner(publication, "public Runtime publication job");
   assertGitHubHostedRunner(agentPublication, "public Agent publication job");
@@ -871,6 +1032,9 @@ function assertPublicWorkflow(workflow, policy) {
   if (!validation.includes('tee "$RUNNER_TEMP/public-documentation-validation.json"') ||
       validation.includes("tee dist/public-documentation-validation.json")) {
     fail("public documentation validation must keep evidence outside the exported workspace");
+  }
+  if (validation.includes("cache: pnpm") || validation.includes("cache-dependency-path: frontend/pnpm-lock.yaml")) {
+    fail("dependency-free public export validation must not configure a pnpm cache");
   }
   for (const required of [
     "pnpm/action-setup@v4",
@@ -934,10 +1098,17 @@ function assertPublicWorkflow(workflow, policy) {
     "fetch-depth: 2",
     "publish: ${{ steps.intent.outputs.publish }}",
     'echo "publish=false" >> "$GITHUB_OUTPUT"',
+    'if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then',
+    '[ "$GITHUB_REF" = refs/heads/main ] || exit 0',
+    '[ "$DISPATCH_PUBLISH" = true ] || exit 0',
+    'DISPATCH_RELEASE_TAG: ${{ inputs.release_tag || \'\' }}',
+    'release_tag="$(jq -er \'.releaseTag\' PUBLIC_PROVENANCE.json)"',
+    '[ "$DISPATCH_RELEASE_TAG" = "$release_tag" ] || {',
+    "manual recovery Tag must exactly match PUBLIC_PROVENANCE.json",
+    'echo "Verified explicit immutable recovery: publish=true"',
     '[ "$GITHUB_EVENT_NAME" = push ] || exit 0',
     '[ "$GITHUB_REF" = refs/heads/main ] || exit 0',
     "git rev-parse --verify HEAD^",
-    'release_tag="$(jq -er \'.releaseTag\' PUBLIC_PROVENANCE.json)"',
     "merge_subject_pattern=",
     "squash_subject_pattern=",
     '[[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || exit 0',
@@ -975,6 +1146,14 @@ function assertPublicWorkflow(workflow, policy) {
     "download_verified_asset release.manifest.yaml dist/public-composition/previous.manifest.yaml",
     "download_verified_asset component-evidence.json dist/public-composition/previous.component-evidence.json",
     "download_verified_asset public-release-provenance.json dist/public-composition/previous.public-release-provenance.json",
+    "git fetch --no-tags --depth=1 origin",
+    "refs/tags/${previous_release_tag}:refs/tags/${previous_release_tag}",
+    "git show \"${previous_release_tag}:server/cmd/server/migrations/manifest.json\"",
+    "dist/public-composition/previous-migration-manifest.json",
+    "node scripts/ci/resolve-release-migration-metadata.mjs",
+    "--current-migration-manifest server/cmd/server/migrations/manifest.json",
+    "--previous-migration-manifest dist/public-composition/previous-migration-manifest.json",
+    "--output dist/public-composition/previous-migration-resolution.json",
     "dist/public-composition/previous.manifest.yaml",
     "dist/public-composition/previous.component-evidence.json",
     "dist/public-composition/previous.public-release-provenance.json",
@@ -1008,10 +1187,13 @@ function assertPublicWorkflow(workflow, policy) {
       fail(`${name} must consume the checked-out publication intent, completed public validation, and runtime composition plan`);
     }
   }
-  if (!publication.includes("squash_subject_pattern") ||
-      !publication.includes("chore\\\\(export\\\\):") ||
-      !publication.includes("head_subject\" =~ $merge_subject_pattern || \"$head_subject\" =~ $squash_subject_pattern")) {
-    fail("public Runtime publication must accept the configured squash-merge commit identity");
+  for (const [name, block] of [["public Runtime publication", publication], ["public Agent publication", agentPublication]]) {
+    if (!block.includes('if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then') ||
+        !block.includes("squash_subject_pattern") ||
+        !block.includes("chore\\\\(export\\\\):") ||
+        !block.includes("head_subject\" =~ $merge_subject_pattern || \"$head_subject\" =~ $squash_subject_pattern")) {
+      fail(`${name} must preserve generated-export head validation outside publication-intent-authorized recovery`);
+    }
   }
   for (const required of [
     'commit_ref="${image}:public-${GITHUB_SHA}"',
@@ -1054,6 +1236,7 @@ function assertPublicWorkflow(workflow, policy) {
     "render-release-component-build-contexts.mjs",
     "--plan dist/public-composition/runtime-composition-plan.json",
     "--base-images dist/public-composition/base-images.json",
+    "--transport dockerhub",
     // The current public projection checker rejects the unspaced `build-contexts:` key.
     "build-contexts : ${{ steps.base-contexts.outputs.build_contexts }}",
   ]) {
@@ -1142,6 +1325,7 @@ function assertPublicWorkflow(workflow, policy) {
     "--plan dist/public-composition/runtime-composition-plan.json",
     "--component-id runtime.agent",
     "--base-images dist/public-composition/base-images.json",
+    "--transport dockerhub",
     "build-contexts: ${{ steps.base-contexts.outputs.build_contexts }}",
   ]) {
     if (!agentPublication.includes(required)) fail(`public Agent publication must pin BuildKit base contexts through the composition renderer: ${required}`);
@@ -1177,6 +1361,19 @@ function assertPublicWorkflow(workflow, policy) {
   const packagePublish = jobBlock(workflow, "public-engine-package-publish");
   const engineManifest = jobBlock(workflow, "public-engine-release-manifest");
   const finalRelease = jobBlock(workflow, "publish-final-release");
+  if (!/^    concurrency:\s*\n\s+group:\s*cloudflare-worker-production\s*\n\s+cancel-in-progress:\s*false\s*$/m.test(finalRelease)) {
+    fail("public final release must serialize production Cloudflare Worker deployments without cancellation");
+  }
+  if (!finalRelease.includes("environment: public-release") ||
+      !finalRelease.includes("CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}") ||
+      !finalRelease.includes("CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}")) {
+    fail("Cloudflare Worker deployment must use the protected public-release environment secrets");
+  }
+  for (const block of [validation, frontendValidation, scopeValidation, goValidation, protoValidation, contextValidation, aggregate, publicationIntent, runtimeCompositionResolver, publication, agentPublication]) {
+    if (/CLOUDFLARE_(?:API_TOKEN|ACCOUNT_ID)|wrangler deploy|docker\.lunafox\.cc\.cd/.test(block)) {
+      fail("Cloudflare production credentials and deployment markers must stay out of non-final public jobs");
+    }
+  }
   const engineDiscoveryArtifactName = "public-engine-runtime-discovery-${{ github.sha }}";
   const engineDiscoveryArtifactDirectory = "dist/public-engine-runtime-discovery";
   const engineDiscoveryArtifactUpload = [
@@ -1211,7 +1408,9 @@ function assertPublicWorkflow(workflow, policy) {
       fail(`${name} must not contain private Agent/release authority`);
     }
   }
-  if (!hasRequiredJobNeeds(engineDiscovery, ["publication-intent", "public-validation", "resolve-public-runtime-composition"]) ||
+  if (!hasRequiredJobNeeds(engineDiscovery, ["publication-intent", "public-validation", "resolve-public-runtime-composition", "publish-runtime-images", "publish-agent-image"]) ||
+      !engineDiscovery.includes("needs.publish-runtime-images.result == 'success'") ||
+      !engineDiscovery.includes("needs.publish-agent-image.result == 'success'") ||
       !engineDiscovery.includes("outputs:") ||
       !engineDiscovery.includes("steps.matrix.outputs.matrix") ||
       !engineDiscovery.includes("-command discover") ||
@@ -1221,12 +1420,12 @@ function assertPublicWorkflow(workflow, policy) {
       !engineDiscovery.includes(engineDiscoveryArtifactUpload) ||
       engineDiscovery.includes("packages: write") ||
       engineDiscovery.includes("environment: public-engine-release")) {
-    fail("public Engine Runtime discovery must source-bind and emit the dynamic matrix with its canonical artifact layout and without publication authority");
+    fail("public Engine Runtime discovery must wait for Runtime and Agent publication, then source-bind and emit the dynamic matrix with its canonical artifact layout and without publication authority");
   }
   if (!hasRequiredJobNeeds(engineBuild, ["publication-intent", "public-engine-runtime-discover"]) ||
       !engineBuild.includes("strategy:") ||
       !engineBuild.includes("fail-fast: true") ||
-      !engineBuild.includes("max-parallel: 16") ||
+      !engineBuild.includes("max-parallel: 3") ||
       !engineBuild.includes("fromJSON(needs.public-engine-runtime-discover.outputs.platform_matrix)") ||
       !engineBuild.includes("runs-on: ${{ matrix.runner }}") ||
       !engineBuild.includes("matrix.platform") ||
@@ -1245,19 +1444,58 @@ function assertPublicWorkflow(workflow, policy) {
     "render-release-component-build-contexts.mjs",
     "--plan dist/public-composition/runtime-composition-plan.json",
     "--base-images dist/public-composition/base-images.json",
+    "--transport dockerhub",
     "ENGINE_BASE_IMAGE_CONTEXTS_FILE: ${{ steps.base-contexts.outputs.path }}",
   ]) {
     if (!engineBuild.includes(required)) fail(`public Engine Runtime build must pin BuildKit base contexts through the composition renderer: ${required}`);
+  }
+  for (const required of [
+    "inspect_base_digest()",
+    "data limit exceeded",
+    "connection reset",
+    "[ \"$inspect_status\" -eq 75 ] || exit \"$inspect_status\"",
+    "base image transport digest mismatch",
+  ]) {
+    if (!workflow.includes(required)) fail(`public composition must keep the classified base-image transport fallback: ${required}`);
   }
   if (/continue-on-error\s*:/.test(engineBuild) || /fail-fast\s*:\s*false/.test(engineBuild)) {
     fail("public Engine Runtime matrix must fail fast without optional children");
   }
   if (!hasRequiredJobNeeds(engineFinalize, ["publication-intent", "public-engine-runtime-discover", "public-engine-runtime-build"]) ||
-      !engineFinalize.includes("max-parallel: 8") ||
+      !engineFinalize.includes("max-parallel: 2") ||
       !engineFinalize.includes("finalize-engine-runtime-platforms.sh") ||
       !engineFinalize.includes("public-engine-runtime-shard-") ||
       !engineFinalize.includes("packages: write")) {
     fail("public Engine Runtime finalize must assemble each exact native platform pair with publication authority");
+  }
+  const normalizedEngineFinalize = withoutComments(engineFinalize).replace(/\\\n\s*/g, " ");
+  for (const required of [
+    "id: registry-auth",
+    `auth_root=\"$(mktemp -d \"$RUNNER_TEMP/lunafox-engine-registry-auth.XXXXXX\")\"`,
+    `printf '{\"auths\":{}}\\n' > \"$docker_config/config.json\"`,
+    `printf '{\"auths\":{}}\\n' > \"$oras_config\"`,
+    "id: buildx",
+    "DOCKER_CONFIG: ${{ steps.registry-auth.outputs.docker_config }}",
+    "name: Authenticate isolated Engine ORAS config",
+    "ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}",
+    "ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}",
+    "ORAS_GHCR_USERNAME: ${{ github.actor }}",
+    "ORAS_GHCR_TOKEN: ${{ github.token }}",
+    "ENGINE_ORAS_REGISTRY_CONFIG: ${{ steps.registry-auth.outputs.oras_config }}",
+    "ENGINE_BUILDER_NAME: ${{ steps.buildx.outputs.name }}",
+    "name: Remove Engine registry credentials",
+    `rm -rf -- \"$ENGINE_REGISTRY_AUTH_ROOT\"`,
+  ]) {
+    if (!engineFinalize.includes(required)) fail(`public Engine Runtime finalize must establish isolated authenticated transport: ${required}`);
+  }
+  const finalizeOrasLogins = normalizedEngineFinalize.match(/oras login\b/g) ?? [];
+  const finalizeLoginLogouts = normalizedEngineFinalize.match(/logout: false\b/g) ?? [];
+  if (finalizeOrasLogins.length !== 2 ||
+      finalizeLoginLogouts.length !== 2 ||
+      !/oras login\s+--registry-config "\$ORAS_CONFIG"\s+--username "\$ORAS_DOCKERHUB_USERNAME"/.test(normalizedEngineFinalize) ||
+      !/oras login\s+--registry-config "\$ORAS_CONFIG"\s+--username "\$ORAS_GHCR_USERNAME"/.test(normalizedEngineFinalize) ||
+      normalizedEngineFinalize.includes('DOCKER_CONFIG="$anonymous_config"')) {
+    fail("public Engine Runtime finalize must authenticate both registries explicitly without an anonymous-config collapse");
   }
   if (!hasRequiredJobNeeds(engineAggregate, ["publication-intent", "public-engine-runtime-discover", "public-engine-runtime-finalize"]) ||
       !engineAggregate.includes("aggregate-engine-runtime-image-shards.sh") ||
@@ -1300,7 +1538,11 @@ function assertPublicWorkflow(workflow, policy) {
 
   const publicCosignIdentityRegexp = "'^https://github\\.com/yyhuni/lunafox/\\.github/workflows/public-validate\\.yml@refs/heads/main$'";
   const overescapedPublicCosignIdentityRegexp = "'^https://github\\\\.com/yyhuni/lunafox/\\\\.github/workflows/public-validate\\\\.yml@refs/heads/main$'";
-  if (workflow.includes(overescapedPublicCosignIdentityRegexp) || countOccurrences(workflow, publicCosignIdentityRegexp) !== 4) {
+  const immutableRecoveryCosignIdentity = 'public_cosign_identity="^https://github\\.com/yyhuni/lunafox/\\.github/workflows/public-validate\\.yml@refs/heads/main$"';
+  if (workflow.includes(overescapedPublicCosignIdentityRegexp) ||
+      countOccurrences(workflow, publicCosignIdentityRegexp) !== 4 ||
+      countOccurrences(immutableRecovery, immutableRecoveryCosignIdentity) !== 1 ||
+      !immutableRecovery.includes('--certificate-identity-regexp "$public_cosign_identity"')) {
     fail("public workflow must pass the exact single-escaped main workflow identity to cosign");
   }
   if (!hasRequiredJobNeeds(engineSign, ["publication-intent", "public-engine-runtime-discover", "public-engine-runtime-aggregate"]) ||
@@ -1345,9 +1587,49 @@ function assertPublicWorkflow(workflow, policy) {
       !packagePublish.includes("public-engine-package-digests")) {
     fail("public Engine Package lane must publish, sign, verify, and retain digest evidence");
   }
+  // The already-published alpha.190 workflow checker recognizes a legacy
+  // ORAS text marker in comments. Strip YAML comments before enforcing the
+  // executable promotion contract so that marker cannot reintroduce an
+  // unauthenticated copy path.
+  const normalizedPackagePublish = withoutComments(packagePublish).replace(/\\\n\s*/g, " ");
+  for (const required of [
+    'ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}',
+    'ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}',
+    'ORAS_GHCR_USERNAME: ${{ github.actor }}',
+    'ORAS_GHCR_TOKEN: ${{ github.token }}',
+    'oras_config="$(mktemp -d)"',
+    'anonymous_config="$(mktemp -d)"',
+    'trap \'rm -f "$publisher"; rm -rf "$oras_config" "$anonymous_config"\' EXIT',
+    'printf \'%s\' "$ORAS_DOCKERHUB_TOKEN" | oras login',
+    '--password-stdin docker.io',
+    'printf \'%s\' "$ORAS_GHCR_TOKEN" | oras login',
+    '--password-stdin ghcr.io',
+    'printf \'{"auths":{}}\\n\' > "$anonymous_config/config.json"',
+    'DOCKER_CONFIG="$anonymous_config" cosign verify',
+  ]) {
+    if (!packagePublish.includes(required)) {
+      fail(`public Engine Package lane must establish isolated ORAS authentication: ${required}`);
+    }
+  }
+  const packageOrasLogins = normalizedPackagePublish.match(/oras login\b/g) ?? [];
+  const configuredPackageOrasLogins = normalizedPackagePublish.match(
+    /oras login\s+--registry-config "\$oras_config\/config\.json"/g,
+  ) ?? [];
   if (!packagePublish.includes('package_tag="package-v2-${package_digest#sha256:}"') ||
       !packagePublish.includes('--tag "$package_tag"') ||
-      !packagePublish.includes('oras cp "$docker_ref" "$ghcr_location:$package_tag"') ||
+      packageOrasLogins.length !== 2 ||
+      packageOrasLogins.length !== configuredPackageOrasLogins.length ||
+      !/oras cp\s+--from-registry-config "\$oras_config\/config\.json"\s+--to-registry-config "\$oras_config\/config\.json"\s+"\$docker_ref"\s+"\$ghcr_location:\$package_tag"/.test(normalizedPackagePublish) ||
+      /oras cp\s+"\$docker_ref"\s+"\$ghcr_location:\$package_tag"/.test(normalizedPackagePublish) ||
+      packagePublish.includes("package-v2-${release_tag}")) {
+    fail("public Engine Package lane must bind its cross-registry ORAS copy to the authenticated config");
+  }
+  if (normalizedPackagePublish.includes('DOCKER_CONFIG="$oras_config"') ||
+      !/oras manifest fetch\s+--registry-config "\$anonymous_config\/config\.json"/.test(normalizedPackagePublish)) {
+    fail("public Engine Package lane must keep anonymous descriptor verification isolated from publishing credentials");
+  }
+  if (!packagePublish.includes('package_tag="package-v2-${package_digest#sha256:}"') ||
+      !packagePublish.includes('--tag "$package_tag"') ||
       packagePublish.includes("package-v2-${release_tag}")) {
     fail("public Engine Package lane must derive its publication handle from immutable archive bytes, not the product release tag");
   }
@@ -1392,6 +1674,30 @@ function assertPublicWorkflow(workflow, policy) {
       fail(`public final release must finalize the canonical runtime composition before manifest generation: ${required}`);
     }
   }
+  const finalCompositionReconciliation = workflowStepBlock(
+    finalRelease,
+    "      - id: reconciled_composition\n        name: Reconcile canonical Runtime composition with final tag digests",
+  );
+  const promotionIndex = finalRelease.indexOf("      - name: Promote every Runtime digest to both final registries");
+  const reconciliationIndex = finalRelease.indexOf("      - id: reconciled_composition");
+  const manifestIndex = finalRelease.indexOf("      - name: Generate and verify the complete release manifest");
+  if (promotionIndex < 0 || reconciliationIndex <= promotionIndex || manifestIndex <= reconciliationIndex) {
+    fail("public final release must reconcile Runtime evidence and composition after final-tag resolution and before manifest generation");
+  }
+  for (const required of [
+    "--mode final",
+    "--runtime-evidence-dir dist/final/runtime-evidence",
+    "--output dist/final/runtime-composition.core.json",
+    "--json | tee dist/final/runtime-composition-reconciliation.json",
+    "cp dist/final/runtime-composition-reconciliation.json dist/final/runtime-composition-finalization.json",
+    "--workflow-run-id \"$GITHUB_RUN_ID\"",
+    "node scripts/ci/verify-public-runtime-image-evidence.mjs",
+    'echo "composition_digest=$composition_digest" >> "$GITHUB_OUTPUT"',
+  ]) {
+    if (!finalCompositionReconciliation.includes(required)) {
+      fail(`public final release must reconcile Runtime evidence and composition after final-tag resolution: ${required}`);
+    }
+  }
   const finalManifestGeneration = workflowStepBlock(
     finalRelease,
     "      - name: Generate and verify the complete release manifest",
@@ -1401,11 +1707,16 @@ function assertPublicWorkflow(workflow, policy) {
       !finalRelease.includes('echo "profile=$release_profile" >> "$GITHUB_OUTPUT"')) {
     fail("public final release must resolve one version-scoped release compatibility profile");
   }
-  if (!finalManifestGeneration.includes("RUNTIME_COMPOSITION_SHA256: ${{ steps.composition.outputs.composition_digest }}") ||
+  if (!finalManifestGeneration.includes("RUNTIME_COMPOSITION_SHA256: ${{ steps.reconciled_composition.outputs.composition_digest }}") ||
       !finalManifestGeneration.includes("generate-release-manifest.sh") ||
       !finalManifestGeneration.includes('RELEASE_PROFILE: ${{ steps.release_profile.outputs.profile }}') ||
-      !finalManifestGeneration.includes('--release-profile "$RELEASE_PROFILE"')) {
-    fail("public final release must pass the canonical runtime composition digest into manifest generation and pass the resolved profile");
+      !finalManifestGeneration.includes('RELEASE_MIGRATION_TYPE: ${{ vars.RELEASE_MIGRATION_TYPE }}') ||
+      !finalManifestGeneration.includes('--release-profile "$RELEASE_PROFILE"') ||
+      !finalManifestGeneration.includes('previous_migration_manifest="dist/final/composition-plan/previous-migration-manifest.json"') ||
+      !finalManifestGeneration.includes('previous_release="${{ needs.resolve-public-runtime-composition.outputs.previous_release }}"') ||
+      !finalManifestGeneration.includes('previous_migration_args+=(--previous-migration-manifest "$previous_migration_manifest")') ||
+      !finalManifestGeneration.includes('"${previous_migration_args[@]}"')) {
+    fail("public final release must pass the canonical runtime composition digest into manifest generation and pass the resolved profile, reviewed migration type, and migration boundary");
   }
   for (const required of [
     "--mode bind",
@@ -1452,6 +1763,10 @@ function assertPublicWorkflow(workflow, policy) {
       !finalComposePublication.includes('--release-profile "$RELEASE_PROFILE"')) {
     fail("public final release must pass the bound runtime composition to Compose generation and pass the resolved profile");
   }
+  const preheatDigestLookup = `awk -F= '$1 == "LUNAFOX_PREHEAT_MANIFEST_DIGEST" {print $2}'`;
+  if (!finalComposePublication.includes(preheatDigestLookup)) {
+    fail("public final release must compare the preheat manifest digest with the snapshot .env using a shell-valid lookup");
+  }
   const finalChannelPublication = workflowStepBlock(
     finalRelease,
     "      - name: Generate and publish the release-channel branch",
@@ -1479,6 +1794,46 @@ function assertPublicWorkflow(workflow, policy) {
   );
   if (!finalEvidenceArtifact.includes("dist/final/component-evidence.json")) {
     fail("public final release artifact must retain the durable component evidence bundle");
+  }
+  const workerGate = workflowStepBlock(
+    finalRelease,
+    "      - id: cloudflare_worker\n        name: Deploy and verify the production Cloudflare Registry Worker",
+  );
+  if (workerGate.length === 0) fail("public final release is missing the Cloudflare Worker gate");
+  for (const required of [
+    "pnpm install --frozen-lockfile",
+    "pnpm --dir \"$worker_dir\" test",
+    "pnpm --dir \"$worker_dir\" run typecheck",
+    "pnpm --dir \"$worker_dir\" exec wrangler check startup",
+    "third-party-image-policy.json",
+    "verify-cloudflare-worker-release.mjs",
+    "pnpm --dir \"$worker_dir\" exec wrangler deploy",
+    "pnpm --dir \"$worker_dir\" exec wrangler versions list --json",
+    "cloudflare-worker-release-evidence.json",
+    "Worker Version ID",
+  ]) {
+    if (!workerGate.includes(required)) fail(`Cloudflare Worker gate is missing: ${required}`);
+  }
+  const snapshotIndex = finalRelease.indexOf("      - id: deployment\n");
+  const workerIndex = finalRelease.indexOf("      - id: cloudflare_worker\n");
+  const provenanceIndex = finalRelease.indexOf("      - name: Generate the immutable release provenance record");
+  const channelIndex = finalRelease.indexOf("      - name: Generate and publish the release-channel branch");
+  const releaseIndex = finalRelease.indexOf("      - name: Publish the final GitHub Release metadata");
+  if (snapshotIndex < 0 || workerIndex < snapshotIndex || provenanceIndex < workerIndex || channelIndex < workerIndex || releaseIndex < workerIndex) {
+    fail("Cloudflare Worker gate must run after the deployment snapshot and before provenance/channel/GitHub Release publication");
+  }
+  for (const required of [
+    "workerVersionId",
+    "deploymentTag",
+    "policySha256",
+    "publicSourceCommit",
+    "privateSourceRevision",
+    "smoke",
+    "public-release-provenance.json",
+    "publish_asset dist/final/cloudflare-worker-release-evidence.json",
+    "--cloudflare-worker-evidence dist/final/cloudflare-worker-release-evidence.json",
+  ]) {
+    if (!finalRelease.includes(required)) fail(`public final release must retain Cloudflare Worker evidence binding: ${required}`);
   }
   if (!finalRelease.includes('node scripts/ci/check-public-channel.mjs --root-dir "$channel_root"') ||
       finalRelease.includes("check-public-channel.mjs --root-dir \"$channel_root\" --require-first-release")) {
@@ -1518,9 +1873,55 @@ function assertPublicWorkflow(workflow, policy) {
   if (!finalRelease.includes("final tag cross-registry drift") ||
       !finalRelease.includes("reused_final_tag=true") ||
       !finalRelease.includes("REUSED_FINAL_TAG") ||
+      !finalRelease.includes("expectedBuildDigest") ||
+      !finalRelease.includes("attestationSubject=$image") ||
       !finalRelease.includes('DOCKER_CONFIG="$anonymous_config" cosign verify') ||
       !finalRelease.includes('"^https://github\\\\.com/yyhuni/lunafox/\\\\.github/workflows/public-validate\\\\.yml@refs/heads/main$"')) {
     fail("public final release must anonymously verify and reuse a consistent immutable final tag on a maintenance retry");
+  }
+  const finalRuntimePromotion = workflowStepBlock(
+    finalRelease,
+    "      - name: Promote every Runtime digest to both final registries",
+  );
+  for (const required of [
+    'ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}',
+    'ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}',
+    'ORAS_GHCR_USERNAME: ${{ github.actor }}',
+    'ORAS_GHCR_TOKEN: ${{ github.token }}',
+    'oras_config="$(mktemp -d)"',
+    'anonymous_config="$(mktemp -d)"',
+    'trap \'rm -rf "$oras_config" "$anonymous_config"\' EXIT',
+    'printf \'%s\' "$ORAS_DOCKERHUB_TOKEN" | oras login',
+    '--password-stdin docker.io',
+    'printf \'%s\' "$ORAS_GHCR_TOKEN" | oras login',
+    '--password-stdin ghcr.io',
+    'printf \'{"auths":{}}\\n\' > "$anonymous_config/config.json"',
+    'DOCKER_CONFIG="$anonymous_config" cosign verify',
+  ]) {
+    if (!finalRuntimePromotion.includes(required)) {
+      fail(`public final Runtime promotion must establish isolated ORAS authentication: ${required}`);
+    }
+  }
+  const normalizedFinalRuntimePromotion = finalRuntimePromotion.replace(/\\\n\s*/g, " ");
+  const manifestFetches = normalizedFinalRuntimePromotion.match(/oras manifest fetch\b/g) ?? [];
+  const authenticatedManifestFetches = normalizedFinalRuntimePromotion.match(
+    /oras manifest fetch\s+--registry-config "\$oras_config\/config\.json"/g,
+  ) ?? [];
+  const orasLogins = normalizedFinalRuntimePromotion.match(/oras login\b/g) ?? [];
+  const configuredOrasLogins = normalizedFinalRuntimePromotion.match(
+    /oras login\s+--registry-config "\$oras_config\/config\.json"/g,
+  ) ?? [];
+  if (manifestFetches.length === 0 ||
+      manifestFetches.length !== authenticatedManifestFetches.length ||
+      orasLogins.length !== 2 ||
+      orasLogins.length !== configuredOrasLogins.length ||
+      !/oras cp\s+--from-registry-config "\$oras_config\/config\.json"\s+--to-registry-config "\$oras_config\/config\.json"/.test(normalizedFinalRuntimePromotion) ||
+      normalizedFinalRuntimePromotion.includes('DOCKER_CONFIG="$oras_config"')) {
+    fail("public final Runtime promotion must bind every ORAS operation to an explicit authenticated registry config");
+  }
+  if (!/oras manifest fetch\s+--registry-config "\$oras_config\/config\.json"/.test(normalizedFinalRuntimePromotion) ||
+      !/oras cp\s+--from-registry-config "\$oras_config\/config\.json"/.test(normalizedFinalRuntimePromotion)) {
+    fail("public final Runtime promotion must use the authenticated config for source and destination operations");
   }
 }
 
@@ -1549,10 +1950,14 @@ function assertExportPolicy(exportPolicy) {
     fail("public export policy must constrain protected validation workflow maintenance history");
   }
   const destinationOwnedExact = [...new Set(exportPolicy.destinationOwnedExact ?? [])].sort();
-  const expectedDestinationOwned = [".github/workflows/public-validate.yml", ...DESTINATION_DEPLOYMENT_PATHS, ...OPTIONAL_DESTINATION_OWNED_PATHS].sort();
+  const expectedDestinationOwned = [...new Set([
+    ".github/workflows/public-validate.yml",
+    ...DESTINATION_DEPLOYMENT_PATHS,
+    ...OPTIONAL_DESTINATION_OWNED_PATHS,
+  ])].sort();
   const optionalUntilPresent = [...new Set(exportPolicy.destinationOwnedOptionalUntilPresent ?? [])].sort();
   if (JSON.stringify(optionalUntilPresent) !== JSON.stringify([...OPTIONAL_DESTINATION_OWNED_PATHS].sort())) {
-    fail("public export policy must keep runtime composition optional until a deployment snapshot publishes it");
+    fail("public export policy must keep third-party policy, composition, and preheat assets optional until a deployment snapshot publishes them");
   }
   if (JSON.stringify(destinationOwnedExact) !== JSON.stringify(expectedDestinationOwned)) {
     fail("public export policy must declare the validation workflow and deployment snapshot as destination-owned");
@@ -1583,8 +1988,9 @@ function assertExportPolicy(exportPolicy) {
     if (!exact.has(required)) fail(`export policy does not allow checkout deployment input: ${required}`);
   }
   const groups = exportPolicy.destinationOwnedGroups ?? [];
+  const expectedGroupPaths = [...new Set([...DESTINATION_DEPLOYMENT_PATHS, ...OPTIONAL_DESTINATION_OWNED_PATHS])];
   if (groups.length !== 1 || groups[0]?.sentinel !== ".env" ||
-      JSON.stringify(groups[0]?.paths) !== JSON.stringify(DESTINATION_DEPLOYMENT_PATHS)) {
+      JSON.stringify(groups[0]?.paths) !== JSON.stringify(expectedGroupPaths)) {
     fail("public export policy must define one complete .env-sentinel deployment snapshot group");
   }
   for (const required of DESTINATION_DEPLOYMENT_PATHS) {
@@ -1603,9 +2009,15 @@ function assertExportPolicy(exportPolicy) {
   for (const required of REQUIRED_PUBLIC_RUNTIME_EXACT) {
     if (!exact.has(required)) fail(`export policy is missing public Runtime input: ${required}`);
   }
+  for (const required of REQUIRED_PUBLIC_CLOUDFLARE_WORKER_EXACT) {
+    if (!exact.has(required)) fail(`export policy is missing Cloudflare Worker input: ${required}`);
+  }
   const prefixes = new Set(exportPolicy.allowlist?.prefixes ?? []);
   for (const required of REQUIRED_PUBLIC_RUNTIME_PREFIXES) {
     if (!prefixes.has(required)) fail(`export policy is missing public Runtime prefix: ${required}`);
+  }
+  for (const required of REQUIRED_PUBLIC_CLOUDFLARE_WORKER_PREFIXES) {
+    if (!prefixes.has(required)) fail(`export policy is missing Cloudflare Worker prefix: ${required}`);
   }
   if ((exportPolicy.publicRuntimeImages ?? []).length !== PUBLIC_RUNTIME_COMPONENTS.length) {
     fail("export policy must declare exactly four public Runtime Image descriptors");
@@ -1714,9 +2126,14 @@ function assertExportPolicy(exportPolicy) {
       fail(`export policy must keep private Runtime material denied: ${required}`);
     }
   }
-  for (const required of ["server", "server/scripts", "contracts", "engine-go", "proto", "extensions", "docker/bootstrap", "docker/nginx", "tools/engine-release", "tools/engine-oci-publish"]) {
+  for (const required of ["server", "server/scripts", "contracts", "engine-go", "proto", "extensions", "docker/bootstrap", "docker/nginx", "tools/engine-release", "tools/engine-oci-publish", "tools/lunafox-ghcr-registry/src", "tools/lunafox-ghcr-registry/test", "tools/lunafox-ghcr-registry/scripts"]) {
     if (!prefixes.has(`${required}/`) && ![...prefixes].some((prefix) => prefix.startsWith(`${required}/`))) {
       fail(`export policy does not expose the approved Runtime closure: ${required}`);
+    }
+  }
+  for (const required of ["node_modules", "\\.wrangler", "\\.DS_Store", "worker-(?:configuration", "startup\\.cpuprofile"]) {
+    if (!denyPatternText.some((pattern) => pattern.includes(required))) {
+      fail(`export policy must keep generated Cloudflare Worker state denied: ${required}`);
     }
   }
 }

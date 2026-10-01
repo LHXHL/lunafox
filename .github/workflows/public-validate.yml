@@ -6,6 +6,18 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Explicitly authorize immutable release recovery publication
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Existing release Tag recorded in PUBLIC_PROVENANCE.json
+        required: true
+        type: string
+    # Keep manual recovery explicitly bound to the immutable provenance record;
+    # the inputs are required so an unbound dispatch cannot reach publication.
 
 # Every PR/export job is secretless and runs on GitHub-hosted infrastructure.
 # Publication is a separate protected-main job with its own least-privilege
@@ -53,6 +65,7 @@ jobs:
           fi
 
   validate-export:
+    needs: [publication-intent]
     if: github.repository == 'yyhuni/lunafox'
     name: Public Source Validation
     runs-on: ubuntu-22.04
@@ -80,11 +93,247 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
 
       - name: Verify exact exported file manifest and immutable Agent bundle
-        run: node scripts/ci/check-public-export.mjs --require-agent-bundle --json
+        env:
+          RECOVERY_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && needs.publication-intent.outputs.publish == 'true' }}
+        run: |
+          set -euo pipefail
+          original_head="$(git rev-parse --verify HEAD)"
+          release_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
+          head_subject="$(git log -1 --format=%s)"
+          # Permit the single recovery branch so later protected-main runs can
+          # traverse its workflow-only merge without treating it as source content.
+          workflow_merge_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/workflow/${release_tag//./\\.}(-retry-[0-9]+|-immutable-recovery)?$"
+          workflow_generated_pattern="^chore\\(workflow\\):[[:space:]]update[[:space:]]public[[:space:]]validation[[:space:]]for[[:space:]]${release_tag//./\\.}$"
+          workflow_squash_pattern="^chore\\(workflow\\):[[:space:]]update[[:space:]]public[[:space:]]validation[[:space:]]for[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
+          deployment_generated_pattern="^chore\\(deploy\\):[[:space:]]finalize[[:space:]]deployment[[:space:]]snapshot[[:space:]]${release_tag//./\\.}$"
+          deployment_squash_pattern="^chore\\(deploy\\):[[:space:]]finalize[[:space:]]deployment[[:space:]]snapshot[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
+          expected_workflow_author_name="$(jq -er '.git.workflowAuthorName' scripts/ci/public-export-policy.json)"
+          expected_workflow_author_email="$(jq -er '.git.workflowAuthorEmail' scripts/ci/public-export-policy.json)"
+          expected_deployment_author_name="$(jq -er '.git.deploymentAuthorName' scripts/ci/public-export-policy.json)"
+          expected_deployment_author_email="$(jq -er '.git.deploymentAuthorEmail' scripts/ci/public-export-policy.json)"
+          assert_workflow_maintenance_identity() {
+            local commit="$1" author_name author_email committer_name committer_email
+            author_name="$(git log -1 --format=%an "$commit")"
+            author_email="$(git log -1 --format=%ae "$commit")"
+            committer_name="$(git log -1 --format=%cn "$commit")"
+            committer_email="$(git log -1 --format=%ce "$commit")"
+            if [ "$author_name" = "$expected_workflow_author_name" ] &&
+              [ "$author_email" = "$expected_workflow_author_email" ] &&
+              [ "$committer_name" = "$expected_workflow_author_name" ] &&
+              [ "$committer_email" = "$expected_workflow_author_email" ]; then
+              return 0
+            fi
+            # GitHub records the reviewed author on a squash commit but writes
+            # the commit itself. Require that fixed committer identity instead
+            # of trusting a workflow-looking subject alone.
+            [ -n "$author_name" ] && [ -n "$author_email" ] &&
+              [ "$committer_name" = GitHub ] && [ "$committer_email" = noreply@github.com ] && return 0
+            echo "workflow maintenance commit identity is not authorized: $commit" >&2
+            return 1
+          }
+          assert_workflow_merge_identity() {
+            local commit="$1" author_name author_email committer_name committer_email
+            author_name="$(git log -1 --format=%an "$commit")"
+            author_email="$(git log -1 --format=%ae "$commit")"
+            committer_name="$(git log -1 --format=%cn "$commit")"
+            committer_email="$(git log -1 --format=%ce "$commit")"
+            [ -n "$author_name" ] && [ -n "$author_email" ] &&
+              [ "$committer_name" = GitHub ] && [ "$committer_email" = noreply@github.com ] || {
+              echo "workflow maintenance merge identity is not authorized: $commit" >&2
+              return 1
+            }
+          }
+          assert_deployment_squash_identity() {
+            local commit="$1" author_name author_email committer_name committer_email
+            author_name="$(git log -1 --format=%an "$commit")"
+            author_email="$(git log -1 --format=%ae "$commit")"
+            committer_name="$(git log -1 --format=%cn "$commit")"
+            committer_email="$(git log -1 --format=%ce "$commit")"
+            # GitHub rewrites a reviewed deployment PR into a squash commit:
+            # preserve the reviewed author, but require GitHub as the committer.
+            [ -n "$author_name" ] && [ -n "$author_email" ] &&
+              [ "$committer_name" = GitHub ] && [ "$committer_email" = noreply@github.com ] || {
+              echo "deployment snapshot squash identity is not authorized: $commit" >&2
+              return 1
+            }
+          }
+          validate_deployment_snapshot() {
+            local commit="$1" subject="$2" parent
+            if git rev-parse --verify "${commit}^2" >/dev/null 2>&1; then
+              echo "deployment snapshot must have exactly one parent: $commit" >&2
+              return 1
+            fi
+            parent="$(git rev-parse --verify "${commit}^1")"
+            if [[ "$subject" =~ $deployment_generated_pattern ]]; then
+              [ "$(git log -1 --format=%an "$commit")" = "$expected_deployment_author_name" ] || {
+                echo "deployment snapshot author identity is not authorized" >&2
+                return 1
+              }
+              [ "$(git log -1 --format=%ae "$commit")" = "$expected_deployment_author_email" ] || {
+                echo "deployment snapshot author email is not authorized" >&2
+                return 1
+              }
+              [ "$(git log -1 --format=%cn "$commit")" = "$expected_deployment_author_name" ] || {
+                echo "deployment snapshot committer identity is not authorized" >&2
+                return 1
+              }
+              [ "$(git log -1 --format=%ce "$commit")" = "$expected_deployment_author_email" ] || {
+                echo "deployment snapshot committer email is not authorized" >&2
+                return 1
+              }
+            elif [[ "$subject" =~ $deployment_squash_pattern ]]; then
+              assert_deployment_squash_identity "$commit"
+            else
+              echo "deployment snapshot subject is not authorized: $subject" >&2
+              return 1
+            fi
+            expected_deployment_paths="$(jq -er '
+              [.destinationOwnedGroups[] | select(.sentinel == ".env")]
+              | if length == 1 then .[0].paths | sort | join("\n") else error("deployment group policy is ambiguous") end
+            ' scripts/ci/public-export-policy.json)"
+            actual_deployment_paths="$(git diff --name-only "$parent" "$commit" | sort)"
+            # Git records only byte or mode changes. A destination-owned member
+            # that already has the generated bytes can therefore be unchanged;
+            # the resulting tree still has to contain the complete group.
+            [ -n "$actual_deployment_paths" ] || {
+              echo "deployment snapshot must change at least one destination-owned path" >&2
+              printf 'expected paths:\n%s\nactual paths:\n%s\n' "$expected_deployment_paths" "$actual_deployment_paths" >&2
+              return 1
+            }
+            unexpected_deployment_paths="$(comm -23 \
+              <(printf '%s\n' "$actual_deployment_paths" | sed '/^$/d' | LC_ALL=C sort) \
+              <(printf '%s\n' "$expected_deployment_paths" | sed '/^$/d' | LC_ALL=C sort))"
+            [ -z "$unexpected_deployment_paths" ] || {
+              echo "deployment snapshot changed a path outside the destination-owned group" >&2
+              printf 'unexpected paths:\n%s\n' "$unexpected_deployment_paths" >&2
+              return 1
+            }
+            while IFS= read -r expected_path; do
+              [ -n "$expected_path" ] || continue
+              [ "$(git cat-file -t "$commit:$expected_path" 2>/dev/null || true)" = blob ] || {
+                echo "deployment snapshot is missing a complete destination-owned member: $expected_path" >&2
+                return 1
+              }
+            done <<< "$expected_deployment_paths"
+            validated_deployment_parent="$parent"
+          }
+          deployment_recovery=false
+          recovery_parent=""
+          if [[ "$head_subject" =~ $deployment_generated_pattern || "$head_subject" =~ $deployment_squash_pattern ]]; then
+            # A deployment snapshot is destination-owned, but its parent may be
+            # a chain of workflow-only maintenance commits. Bind recovery to the
+            # immutable snapshot shape before temporarily checking its source.
+            deployment_recovery=true
+            validate_deployment_snapshot "$original_head" "$head_subject"
+            deployment_parent="$validated_deployment_parent"
+            recovery_parent="$deployment_parent"
+          fi
+          maintenance_head=false
+          if [ "$deployment_recovery" = true ]; then
+            maintenance_head=true
+          elif [ "$RECOVERY_PUBLISH" = true ]; then
+            maintenance_head=true
+          elif [[ "$head_subject" =~ $workflow_merge_pattern || "$head_subject" =~ $workflow_generated_pattern || "$head_subject" =~ $workflow_squash_pattern ]]; then
+            maintenance_head=true
+          fi
+          if [ "$maintenance_head" = true ]; then
+            # Workflow maintenance is destination-owned and lands after its source
+            # projection. Verify every adjacent maintenance commit before checking
+            # the first unchanged source projection tree.
+            if [ "$deployment_recovery" = false ]; then
+              recovery_base="$(git rev-parse --verify HEAD^1)"
+              recovery_parent=""
+              if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+                recovery_parent="$(git rev-parse --verify HEAD^2)"
+              fi
+              if [ -n "$recovery_parent" ]; then
+                [[ "$head_subject" =~ $workflow_merge_pattern ]] || {
+                  echo "authorized recovery must run from the matching workflow maintenance merge: $head_subject" >&2
+                  exit 1
+                }
+                assert_workflow_merge_identity "$original_head"
+                [ "$(git diff --name-only "$recovery_base" "$recovery_parent")" = ".github/workflows/public-validate.yml" ] || {
+                  echo "authorized recovery parents must differ only in the destination-owned workflow" >&2
+                  exit 1
+                }
+                git diff --quiet "$recovery_parent" HEAD || {
+                  echo "authorized recovery merge must resolve to the verified workflow-maintenance parent" >&2
+                  exit 1
+                }
+                recovery_parent="$recovery_base"
+              else
+                [[ "$head_subject" =~ $workflow_generated_pattern || "$head_subject" =~ $workflow_squash_pattern ]] || {
+                  echo "authorized recovery must run from the matching workflow maintenance merge or squash commit: $head_subject" >&2
+                  exit 1
+                }
+                assert_workflow_maintenance_identity "$original_head"
+                [ "$(git diff --name-only "$recovery_base" HEAD)" = ".github/workflows/public-validate.yml" ] || {
+                  echo "authorized recovery squash commit must change only the destination-owned workflow" >&2
+                  exit 1
+                }
+                recovery_parent="$recovery_base"
+              fi
+            fi
+            while [ -n "$recovery_parent" ]; do
+              candidate_parent="$(git rev-parse --verify "${recovery_parent}^1" 2>/dev/null || true)"
+              [ -n "$candidate_parent" ] || break
+              candidate_subject="$(git log -1 --format=%s "$recovery_parent")"
+              if [[ "$candidate_subject" =~ $workflow_merge_pattern ]]; then
+                candidate_second_parent="$(git rev-parse --verify "${recovery_parent}^2" 2>/dev/null || true)"
+                [ -n "$candidate_second_parent" ] || {
+                  echo "workflow maintenance merge is missing its second parent: $recovery_parent" >&2
+                  exit 1
+                }
+                assert_workflow_merge_identity "$recovery_parent"
+                [ "$(git diff --name-only "$candidate_parent" "$candidate_second_parent")" = ".github/workflows/public-validate.yml" ] || {
+                  echo "workflow maintenance merge parents must differ only in the destination-owned workflow" >&2
+                  exit 1
+                }
+                git diff --quiet "$candidate_second_parent" "$recovery_parent" || {
+                  echo "workflow maintenance merge tree must equal its reviewed parent" >&2
+                  exit 1
+                }
+                recovery_parent="$candidate_parent"
+              elif [[ "$candidate_subject" =~ $workflow_generated_pattern || "$candidate_subject" =~ $workflow_squash_pattern ]]; then
+                if git rev-parse --verify "${recovery_parent}^2" >/dev/null 2>&1; then
+                  echo "workflow maintenance squash commit must have exactly one parent: $recovery_parent" >&2
+                  exit 1
+                fi
+                assert_workflow_maintenance_identity "$recovery_parent"
+                [ "$(git diff --name-only "$candidate_parent" "$recovery_parent")" = ".github/workflows/public-validate.yml" ] || {
+                  echo "workflow maintenance squash commits must change only the destination-owned workflow" >&2
+                  exit 1
+                }
+                recovery_parent="$candidate_parent"
+              elif [[ "$candidate_subject" =~ $deployment_generated_pattern || "$candidate_subject" =~ $deployment_squash_pattern ]]; then
+                validate_deployment_snapshot "$recovery_parent" "$candidate_subject"
+                [ "$validated_deployment_parent" = "$candidate_parent" ] || {
+                  echo "deployment snapshot parent resolution changed during recovery: $recovery_parent" >&2
+                  exit 1
+                }
+                recovery_parent="$candidate_parent"
+              else
+                break
+              fi
+            done
+            git checkout --detach "$recovery_parent"
+          fi
+          node scripts/ci/check-public-export.mjs --require-agent-bundle --json
+          if [ "$deployment_recovery" = true ]; then
+            # Downstream jobs must inspect the actual deployment snapshot after
+            # the source projection has passed its complete export validation.
+            git diff --quiet || {
+              echo "source projection validation modified the checkout" >&2
+              exit 1
+            }
+            git checkout --detach "$original_head"
+            [ "$(git rev-parse --verify HEAD)" = "$original_head" ] || {
+              echo "failed to restore deployment snapshot after source validation" >&2
+              exit 1
+            }
+          fi
 
       - name: Verify bilingual public documentation
         # The destination-owned workflow is merged before the next source
@@ -144,7 +393,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node --test scripts/ci/publish-public-deployment.test.mjs scripts/ci/finalize-engine-runtime-platforms.test.mjs
+          node --test scripts/ci/publish-public-deployment.test.mjs scripts/ci/generate-compose-deployment.test.mjs scripts/ci/finalize-engine-runtime-platforms.test.mjs
           if [ -f scripts/ci/component-evidence-bundle-selftest.mjs ]; then
             node scripts/ci/component-evidence-bundle-selftest.mjs
           fi
@@ -452,16 +701,35 @@ jobs:
       contents: read
     outputs:
       publish: ${{ steps.intent.outputs.publish }}
+      recovery: ${{ steps.intent.outputs.recovery }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
       - id: intent
         name: Verify the source projection merge
+        env:
+          DISPATCH_PUBLISH: ${{ inputs.publish || '' }}
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag || '' }}
         shell: bash
         run: |
           set -euo pipefail
           echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "recovery=false" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] || exit 0
+            [ "$DISPATCH_PUBLISH" = true ] || exit 0
+            test -f PUBLIC_PROVENANCE.json
+            release_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
+            [ "$DISPATCH_RELEASE_TAG" = "$release_tag" ] || {
+              echo "manual recovery Tag must exactly match PUBLIC_PROVENANCE.json" >&2
+              exit 1
+            }
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "recovery=true" >> "$GITHUB_OUTPUT"
+            echo "Verified explicit immutable recovery: publish=true"
+            exit 0
+          fi
           [ "$GITHUB_EVENT_NAME" = push ] || exit 0
           [ "$GITHUB_REF" = refs/heads/main ] || exit 0
           git rev-parse --verify HEAD^ >/dev/null
@@ -477,13 +745,530 @@ jobs:
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "Verified protected source projection: publish=true"
 
+  # A historical deployment snapshot is the authority for this lane. It must
+  # never return to the normal release graph, because that graph can create a
+  # different OCI closure before discovering the already-merged snapshot.
+  recover-immutable-public-release:
+    if: needs.publication-intent.outputs.recovery == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success'
+    name: Recover Immutable Public Release
+    needs: [publication-intent, public-validation]
+    runs-on: ubuntu-22.04
+    environment: public-release
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install public snapshot verification dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ripgrep
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/engine-oci-publish/go.mod
+          cache-dependency-path: |
+            tools/engine-oci-publish/go.sum
+            contracts/go.sum
+      - uses: oras-project/setup-oras@v1
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Verify immutable snapshot and publish terminal metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          recovery_root="$GITHUB_WORKSPACE/dist/immutable-recovery"
+          snapshot_root=""
+          channel_worktree=""
+          anonymous_config=""
+          snapshot_sha=""
+          mkdir -p "$recovery_root"
+          fail() {
+            echo "immutable public release recovery failed: $*" >&2
+            exit 1
+          }
+          cleanup() {
+            status=$?
+            set +e
+            jq -n \
+              --arg tag "$RELEASE_TAG" \
+              --arg snapshot "$snapshot_sha" \
+              --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --arg status "$status" \
+              '{schemaVersion:1,kind:"lunafox.immutable-public-release-recovery-run.v1",releaseTag:$tag,snapshotCommit:($snapshot // null),run:$run,status:($status | tonumber)}' \
+              > "$recovery_root/run-result.json"
+            if [ -n "$snapshot_root" ] && [[ "$snapshot_root" == "$RUNNER_TEMP"/immutable-public-release-snapshot-* ]]; then
+              git worktree remove --force "$snapshot_root" >/dev/null 2>&1 || true
+            fi
+            if [ -n "$channel_worktree" ] && [[ "$channel_worktree" == "$RUNNER_TEMP"/immutable-public-release-channel-* ]]; then
+              rm -rf -- "$channel_worktree"
+            fi
+            if [ -n "$anonymous_config" ] && [[ "$anonymous_config" == "$RUNNER_TEMP"/immutable-public-release-anonymous-registry-* ]]; then
+              rm -rf -- "$anonymous_config"
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          test -f PUBLIC_PROVENANCE.json
+          current_tag="$(jq -er '.releaseTag' PUBLIC_PROVENANCE.json)"
+          [ "$RELEASE_TAG" = "$current_tag" ] || fail "dispatch tag is not bound to checked-out provenance"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || fail "dispatch tag is invalid"
+
+          snapshot_candidates="$(
+            git log --first-parent --format='%H%x09%s' HEAD |
+              awk -F '\t' -v tag="$RELEASE_TAG" \
+                'index($2, "chore(deploy): finalize deployment snapshot " tag " (#") == 1 && $2 ~ /\(#[0-9]+\)$/ { print $1 }'
+          )"
+          snapshot_count="$(printf '%s\n' "$snapshot_candidates" | awk 'NF { count += 1 } END { print count + 0 }')"
+          [ "$snapshot_count" = 1 ] || fail "expected one authorized deployment snapshot, found $snapshot_count"
+          snapshot_sha="$snapshot_candidates"
+          snapshot_subject="$(git log -1 --format=%s "$snapshot_sha")"
+          snapshot_pr="$(printf '%s\n' "$snapshot_subject" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')"
+          [ -n "$snapshot_pr" ] || fail "snapshot subject is missing a merged pull request number"
+          git merge-base --is-ancestor "$snapshot_sha" HEAD || fail "snapshot is not an ancestor of protected main"
+          if git rev-parse --verify "$snapshot_sha^2" >/dev/null 2>&1; then
+            fail "snapshot must have exactly one parent"
+          fi
+          snapshot_parent="$(git rev-parse --verify "$snapshot_sha^1")"
+          [ "$(git log -1 --format=%cn "$snapshot_sha")" = GitHub ] || fail "snapshot committer is not GitHub"
+          [ "$(git log -1 --format=%ce "$snapshot_sha")" = noreply@github.com ] || fail "snapshot committer email is not authorized"
+          expected_snapshot_files="$(
+            printf '%s\n' \
+              .env \
+              .env.example \
+              compose.yaml \
+              engine-inventory.yaml \
+              preheat-manifest.json \
+              release.manifest.yaml \
+              runtime-composition.json \
+              third-party-image-policy.json |
+              LC_ALL=C sort
+          )"
+          actual_snapshot_files="$(git diff-tree --no-commit-id --name-only -r "$snapshot_parent" "$snapshot_sha" | LC_ALL=C sort)"
+          # A regenerated member may be byte-identical to the public parent;
+          # validate the complete resulting tree and bound the non-empty diff.
+          [ -n "$actual_snapshot_files" ] || fail "snapshot must change at least one deployment path"
+          unexpected_snapshot_files="$(comm -23 \
+            <(printf '%s\n' "$actual_snapshot_files" | sed '/^$/d' | LC_ALL=C sort) \
+            <(printf '%s\n' "$expected_snapshot_files" | sed '/^$/d' | LC_ALL=C sort))"
+          [ -z "$unexpected_snapshot_files" ] || fail "snapshot changed files outside the deployment closure: $unexpected_snapshot_files"
+          while IFS= read -r expected_snapshot_file; do
+            [ -n "$expected_snapshot_file" ] || continue
+            [ "$(git cat-file -t "$snapshot_sha:$expected_snapshot_file" 2>/dev/null || true)" = blob ] ||
+              fail "snapshot is missing a complete deployment member: $expected_snapshot_file"
+          done <<< "$expected_snapshot_files"
+
+          gh api "/repos/$PUBLIC_REPOSITORY/pulls/$snapshot_pr" > "$recovery_root/snapshot-pull-request.json"
+          jq -e \
+            --arg sha "$snapshot_sha" \
+            --arg title "chore(deploy): finalize deployment snapshot $RELEASE_TAG" \
+            '.state == "closed" and .merged_at != null and .merge_commit_sha == $sha and .base.ref == "main" and .title == $title' \
+            "$recovery_root/snapshot-pull-request.json" >/dev/null ||
+            fail "snapshot pull request is not the authorized protected-main merge"
+
+          snapshot_root="$RUNNER_TEMP/immutable-public-release-snapshot-$GITHUB_RUN_ID-$RANDOM"
+          git worktree add --detach "$snapshot_root" "$snapshot_sha"
+          cmp -s PUBLIC_PROVENANCE.json "$snapshot_root/PUBLIC_PROVENANCE.json" ||
+            fail "current provenance differs from the authorized deployment snapshot"
+          snapshot_source_digest="$(jq -er '.sourceRevisionDigest' "$snapshot_root/PUBLIC_PROVENANCE.json")"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg source "$snapshot_source_digest" \
+            --arg private_repository "$PRIVATE_REPOSITORY" \
+            --arg public_repository "$PUBLIC_REPOSITORY" \
+            '.generatedReadOnly == true and .releaseTag == $tag and .sourceRevisionDigest == $source and .sourceRepository == $private_repository and .destinationRepository == $public_repository' \
+            "$snapshot_root/PUBLIC_PROVENANCE.json" >/dev/null ||
+            fail "snapshot public provenance is not bound to this release"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg source "$snapshot_source_digest" \
+            '.generatedReadOnly == true and .releaseTag == $tag and .sourceRevisionDigest == $source' \
+            "$snapshot_root/PUBLIC_EXPORT_MANIFEST.json" >/dev/null ||
+            fail "snapshot export manifest is not bound to public provenance"
+
+          release_version="$(printf '%s' "$RELEASE_TAG" | sed 's/^v//')"
+          release_profile="$(node "$snapshot_root/scripts/ci/release-compatibility-profile.mjs" --release-version "$release_version")"
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg snapshot "$snapshot_sha" \
+            --arg parent "$snapshot_parent" \
+            --arg pr "$snapshot_pr" \
+            --arg profile "$release_profile" \
+            --arg source "$snapshot_source_digest" \
+            '{schemaVersion:1,kind:"lunafox.immutable-public-release-snapshot.v1",releaseTag:$tag,snapshotCommit:$snapshot,parentCommit:$parent,pullRequest:($pr | tonumber),releaseProfile:$profile,sourceRevisionDigest:$source}' \
+            > "$recovery_root/snapshot-identity.json"
+
+          # public-validation has already verified the source-export history on
+          # its recovery-compatible checkout. Re-running its full-history
+          # validator on the snapshot would reject known legacy maintenance
+          # commits rather than prove anything about this immutable closure.
+          node "$snapshot_root/scripts/ci/verify-public-release.mjs" \
+            --root-dir "$snapshot_root" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --tag "$RELEASE_TAG" \
+            --release-profile "$release_profile" \
+            --probe --json \
+            > "$recovery_root/release-verification.json"
+          node "$snapshot_root/scripts/ci/verify-release-component-composition.mjs" \
+            --composition "$snapshot_root/runtime-composition.json" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --release-profile "$release_profile" --json \
+            > "$recovery_root/composition-verification.json"
+          bash "$snapshot_root/scripts/ci/verify-public-deployment.sh" \
+            --root-dir "$snapshot_root" \
+            --evidence "$recovery_root/deployment-verification.json" \
+            > "$recovery_root/deployment-verification.log"
+
+          mkdir -p "$recovery_root/deployment" "$recovery_root/generated-snapshot"
+          node "$snapshot_root/scripts/ci/generate-compose-deployment.mjs" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --tag "$RELEASE_TAG" \
+            --runtime-composition "$snapshot_root/runtime-composition.json" \
+            --release-profile "$release_profile" \
+            --output "$recovery_root/deployment" \
+            --snapshot "$recovery_root/generated-snapshot" \
+            > "$recovery_root/deployment-packages.json"
+          jq -e --arg name "lunafox-$RELEASE_TAG.zip" \
+            'length == 1 and .[0].name == $name and (.[0].sha256 | test("^[a-f0-9]{64}$"))' \
+            "$recovery_root/deployment-packages.json" >/dev/null ||
+            fail "generated deployment package inventory is invalid"
+          for snapshot_file in \
+            .env \
+            .env.example \
+            compose.yaml \
+            engine-inventory.yaml \
+            preheat-manifest.json \
+            release.manifest.yaml \
+            runtime-composition.json \
+            third-party-image-policy.json; do
+            cmp -s "$snapshot_root/$snapshot_file" "$recovery_root/generated-snapshot/$snapshot_file" ||
+              fail "regenerated deployment closure differs from the authorized snapshot: $snapshot_file"
+          done
+          zip_file="$recovery_root/deployment/lunafox-$RELEASE_TAG.zip"
+          expected_zip_sha="$(jq -er '.[0].sha256' "$recovery_root/deployment-packages.json")"
+          actual_zip_sha="$(sha256sum "$zip_file" | awk '{print $1}')"
+          [ "$actual_zip_sha" = "$expected_zip_sha" ] || fail "generated deployment ZIP digest is not deterministic"
+          unzip -t "$zip_file" >/dev/null
+
+          anonymous_config="$RUNNER_TEMP/immutable-public-release-anonymous-registry-$GITHUB_RUN_ID-$RANDOM"
+          mkdir -p "$anonymous_config"
+          printf '{"auths":{}}\n' > "$anonymous_config/config.json"
+          (cd "$snapshot_root/tools/engine-oci-publish" && go build -o "$RUNNER_TEMP/verify-immutable-recovery-signature" ./cmd/verify-signature)
+          registry_root="$recovery_root/registry"
+          mkdir -p "$registry_root/descriptors" "$registry_root/manifests" "$registry_root/platforms" "$registry_root/signatures" "$registry_root/records"
+          # Keep the historical public policy's four production call sites stable
+          # while applying the same strict workflow identity in this recovery lane.
+          public_cosign_identity="^https://github\.com/yyhuni/lunafox/\.github/workflows/public-validate\.yml@refs/heads/main$"
+          component_count=0
+          while IFS=$'\t' read -r component_id component_kind source_ref digest platforms; do
+            case "$component_kind" in
+              runtime|engine) ;;
+              *) fail "runtime composition contains an unsupported component kind: $component_kind" ;;
+            esac
+            [[ "$source_ref" =~ ^(docker\.io|ghcr\.io)/yyhuni/[A-Za-z0-9._-]+@sha256:[a-f0-9]{64}$ ]] ||
+              fail "runtime composition contains an invalid first-party artifact ref: $component_id"
+            digest_from_ref="$(printf '%s' "$source_ref" | awk -F@ '{print $2}')"
+            [ "$digest_from_ref" = "$digest" ] || fail "runtime composition digest/ref drift: $component_id"
+            safe_id="$(printf '%s' "$component_id" | tr -c 'A-Za-z0-9_.-' '_')"
+            repository="$(printf '%s' "$source_ref" | sed -E 's#^[^/]+/##; s#@.*$##')"
+            docker_ref="docker.io/$repository@$digest"
+            ghcr_ref="ghcr.io/$repository@$digest"
+            for registry in docker.io ghcr.io; do
+              ref="$registry/$repository@$digest"
+              registry_label="$(printf '%s' "$registry" | tr . _)"
+              descriptor_file="$registry_root/descriptors/$safe_id-$registry_label.json"
+              signature_file="$registry_root/signatures/$safe_id-$registry_label.json"
+              oras manifest fetch \
+                --registry-config "$anonymous_config/config.json" \
+                --descriptor "$ref" > "$descriptor_file"
+              jq -e --arg digest "$digest" '.digest == $digest and (.mediaType | type == "string")' "$descriptor_file" >/dev/null ||
+                fail "anonymous descriptor digest verification failed: $ref"
+              DOCKER_CONFIG="$anonymous_config" "$RUNNER_TEMP/verify-immutable-recovery-signature" "$ref" \
+                > "$registry_root/signatures/$safe_id-$registry_label.go.log"
+              DOCKER_CONFIG="$anonymous_config" cosign verify \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-identity-regexp "$public_cosign_identity" \
+                "$ref" > "$signature_file"
+              jq -e 'type == "array" and length > 0' "$signature_file" >/dev/null ||
+                fail "anonymous keyless signature verification failed: $ref"
+              if [ -n "$platforms" ]; then
+                raw_manifest="$registry_root/manifests/$safe_id-$registry_label.json"
+                platform_evidence="$registry_root/platforms/$safe_id-$registry_label.json"
+                oras manifest fetch \
+                  --registry-config "$anonymous_config/config.json" \
+                  "$ref" > "$raw_manifest"
+                node "$snapshot_root/scripts/ci/verify-runtime-image-index.mjs" \
+                  --raw-file "$raw_manifest" \
+                  --expected-digest "$digest" \
+                  --expected-platforms "$platforms" \
+                  > "$platform_evidence"
+              fi
+            done
+            jq -n \
+              --arg component "$component_id" \
+              --arg kind "$component_kind" \
+              --arg digest "$digest" \
+              --arg docker_ref "$docker_ref" \
+              --arg ghcr_ref "$ghcr_ref" \
+              --arg platforms "$platforms" \
+              --slurpfile docker_descriptor "$registry_root/descriptors/$safe_id-docker_io.json" \
+              --slurpfile ghcr_descriptor "$registry_root/descriptors/$safe_id-ghcr_io.json" \
+              '{schemaVersion:1,component:$component,kind:$kind,digest:$digest,dockerHub:{ref:$docker_ref,descriptorDigest:$docker_descriptor[0].digest},ghcr:{ref:$ghcr_ref,descriptorDigest:$ghcr_descriptor[0].digest},platforms:(if $platforms == "" then [] else $platforms | split(",") end),anonymous:true,keylessSignatureVerified:true}' \
+              > "$registry_root/records/$safe_id.json"
+            component_count=$((component_count + 1))
+          done < <(
+            jq -r '.components[] | [.id,.kind,.artifact.ref,.artifact.digest,((.artifact.platforms // []) | join(","))] | @tsv' \
+              "$snapshot_root/runtime-composition.json"
+          )
+          [ "$component_count" -gt 0 ] || fail "runtime composition did not contain a recoverable artifact inventory"
+          jq -s --arg tag "$RELEASE_TAG" \
+            '{schemaVersion:1,kind:"lunafox.immutable-public-release-registry-evidence.v1",releaseTag:$tag,passed:true,records:sort_by(.component)}' \
+            "$registry_root/records/"*.json > "$registry_root/evidence.json"
+
+          channel="canary"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && channel="stable"
+          channel_root="$recovery_root/channel"
+          channel_current_root="$recovery_root/channel-current"
+          mkdir -p "$channel_root/channels" "$channel_root/manifests" \
+            "$channel_current_root/channels" "$channel_current_root/manifests"
+          channel_ref_response="$recovery_root/release-channel-before.json"
+          channel_exists=false
+          if gh api "/repos/$PUBLIC_REPOSITORY/git/ref/heads/release-channel" > "$channel_ref_response" 2>/dev/null; then
+            channel_exists=true
+          else
+            channel_ref_status="$(jq -r '.status // empty' "$channel_ref_response" 2>/dev/null || true)"
+            [ "$channel_ref_status" = "404" ] || fail "failed to resolve release-channel branch (status: $channel_ref_status)"
+          fi
+          channel_worktree="$RUNNER_TEMP/immutable-public-release-channel-$GITHUB_RUN_ID-$RANDOM"
+          if [ "$channel_exists" = true ]; then
+            git clone --depth 1 --branch release-channel "https://x-access-token:$GH_TOKEN@github.com/$PUBLIC_REPOSITORY.git" "$channel_worktree" ||
+              fail "failed to clone the verified release-channel branch"
+            if [ -d "$channel_worktree/channels" ]; then cp -a "$channel_worktree/channels/." "$channel_root/channels/"; fi
+            if [ -d "$channel_worktree/manifests" ]; then cp -a "$channel_worktree/manifests/." "$channel_root/manifests/"; fi
+          else
+            git init "$channel_worktree" >/dev/null
+            git -C "$channel_worktree" remote add origin "https://x-access-token:$GH_TOKEN@github.com/$PUBLIC_REPOSITORY.git"
+            git -C "$channel_worktree" checkout --orphan release-channel >/dev/null
+          fi
+          node "$snapshot_root/scripts/ci/generate-public-channel.mjs" \
+            --tag "$RELEASE_TAG" \
+            --channel "$channel" \
+            --manifest "$snapshot_root/release.manifest.yaml" \
+            --runtime-composition "$snapshot_root/runtime-composition.json" \
+            --release-profile "$release_profile" \
+            --preheat-manifest "$snapshot_root/preheat-manifest.json" \
+            --compose "$snapshot_root/compose.yaml" \
+            --third-party-policy "$snapshot_root/third-party-image-policy.json" \
+            --output-dir "$channel_root" \
+            --publication-complete \
+            > "$recovery_root/channel-generation.json"
+          immutable_channel_files=(
+            "channels/$RELEASE_TAG.env"
+            "manifests/$RELEASE_TAG.yaml"
+            "manifests/$RELEASE_TAG/runtime-composition.json"
+            "manifests/$RELEASE_TAG/preheat-manifest.json"
+            "manifests/$RELEASE_TAG/compose.yaml"
+            "manifests/$RELEASE_TAG/third-party-image-policy.json"
+          )
+          current_channel_files=(
+            "channels/$channel.env"
+            "${immutable_channel_files[@]}"
+          )
+          # Historical records are immutable but can predate the current schema.
+          # Verify only the newly generated record before preserving that history.
+          for relative in "${current_channel_files[@]}"; do
+            [ -f "$channel_root/$relative" ] || fail "generated release-channel record is missing: $relative"
+            mkdir -p "$(dirname "$channel_current_root/$relative")"
+            cp "$channel_root/$relative" "$channel_current_root/$relative"
+          done
+          node "$snapshot_root/scripts/ci/check-public-channel.mjs" \
+            --root-dir "$channel_current_root" > "$recovery_root/channel-verification.json"
+          for relative in "${immutable_channel_files[@]}"; do
+            if [ -e "$channel_worktree/$relative" ]; then
+              [ -f "$channel_worktree/$relative" ] && cmp -s "$channel_worktree/$relative" "$channel_root/$relative" ||
+                fail "existing immutable release-channel record conflicts: $relative"
+            fi
+          done
+          if [ -f "$channel_worktree/channels/$channel.env" ] &&
+              grep -Fxq "VERSION=$RELEASE_TAG" "$channel_worktree/channels/$channel.env"; then
+            cmp -s "$channel_worktree/channels/$channel.env" "$channel_root/channels/$channel.env" ||
+              fail "existing $channel channel alias conflicts with this release"
+          fi
+
+          release_response="$recovery_root/release-before.json"
+          release_exists=false
+          if gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_response" 2>/dev/null; then
+            release_exists=true
+          else
+            release_status="$(jq -r '.status // empty' "$release_response" 2>/dev/null || true)"
+            [ "$release_status" = "404" ] || fail "failed to resolve GitHub Release (status: $release_status)"
+          fi
+          notes_file="$snapshot_root/release-notes/$RELEASE_TAG.md"
+          [ -f "$notes_file" ] || fail "snapshot release notes are missing"
+          prerelease=false
+          [[ "$RELEASE_TAG" =~ -(alpha|beta|rc)\.[0-9]+$ ]] && prerelease=true
+          if [ "$release_exists" = true ]; then
+            jq -e --arg tag "$RELEASE_TAG" --argjson prerelease "$prerelease" \
+              '.tag_name == $tag and .name == $tag and .draft == false and .prerelease == $prerelease' \
+              "$release_response" >/dev/null ||
+              fail "existing GitHub Release metadata conflicts with the immutable snapshot"
+            expected_notes="$(<"$notes_file")"
+            actual_notes="$(jq -r '.body // ""' "$release_response")"
+            [ "$actual_notes" = "$expected_notes" ] || fail "existing GitHub Release notes conflict with the immutable snapshot"
+          fi
+          tag_ref_response="$recovery_root/tag-before.json"
+          tag_sha=""
+          if gh api "/repos/$PUBLIC_REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$tag_ref_response" 2>/dev/null; then
+            tag_sha="$(jq -er '.object.sha' "$tag_ref_response")"
+            [ "$(jq -er '.object.type' "$tag_ref_response")" = commit ] ||
+              fail "existing immutable tag is not a lightweight commit tag"
+          else
+            tag_ref_status="$(jq -r '.status // empty' "$tag_ref_response" 2>/dev/null || true)"
+            [ "$tag_ref_status" = "404" ] || fail "failed to resolve immutable tag (status: $tag_ref_status)"
+          fi
+          [ -z "$tag_sha" ] || [ "$tag_sha" = "$snapshot_sha" ] ||
+            fail "existing immutable tag points to a different commit"
+
+          static_release_assets=(
+            "$snapshot_root/release.manifest.yaml"
+            "$snapshot_root/runtime-composition.json"
+            "$snapshot_root/preheat-manifest.json"
+            "$zip_file"
+            "$recovery_root/deployment-packages.json"
+          )
+          verify_existing_asset() {
+            local file="$1" name expected actual asset_list asset_count asset_json url temporary
+            [ "$release_exists" = true ] || return 0
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            asset_list="$(jq -c --arg name "$name" '[.assets[]? | select(.name == $name)]' "$release_response")"
+            asset_count="$(jq -er 'length' <<<"$asset_list")"
+            [ "$asset_count" -le 1 ] || fail "existing Release has duplicate asset: $name"
+            [ "$asset_count" -eq 0 ] && return 0
+            asset_json="$(jq -ce '.[0]' <<<"$asset_list")"
+            actual="$(jq -r '.digest // empty' <<<"$asset_json")"
+            if [ "$actual" != "$expected" ]; then
+              url="$(jq -er '.url' <<<"$asset_json")"
+              temporary="$(mktemp)"
+              curl --fail --location --silent --show-error \
+                -H 'Accept: application/octet-stream' \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                "$url" -o "$temporary"
+              actual="sha256:$(sha256sum "$temporary" | awk '{print $1}')"
+              rm -f "$temporary"
+            fi
+            [ "$actual" = "$expected" ] || fail "existing Release asset conflicts: $name"
+          }
+          for asset in "${static_release_assets[@]}"; do
+            verify_existing_asset "$asset"
+          done
+
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg snapshot "$snapshot_sha" \
+            --arg profile "$release_profile" \
+            --arg composition "$(jq -er '.compositionDigest' "$snapshot_root/runtime-composition.json")" \
+            --arg manifest "sha256:$(sha256sum "$snapshot_root/release.manifest.yaml" | awk '{print $1}')" \
+            --arg zip "sha256:$actual_zip_sha" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{schemaVersion:1,kind:"lunafox.immutable-public-release-recovery-evidence.v1",status:"verified",releaseTag:$tag,deploymentSnapshotCommit:$snapshot,releaseProfile:$profile,runtimeCompositionDigest:$composition,releaseManifestSha256:$manifest,deploymentZipSha256:$zip,verificationRun:$run}' \
+            > "$recovery_root/immutable-recovery-evidence.json"
+
+          if [ -z "$tag_sha" ]; then
+            # The Git refs API rejects GITHUB_TOKEN when this snapshot's
+            # workflow tree differs from the default branch. The commit is
+            # already reachable from main, so a lightweight tag push adds no
+            # workflow change and stays within contents:write. Never force it.
+            git tag "$RELEASE_TAG" "$snapshot_sha"
+            git push origin "refs/tags/$RELEASE_TAG" ||
+              fail "failed to push the immutable tag for the authorized snapshot"
+            pushed_tag_sha="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
+            [ "$pushed_tag_sha" = "$snapshot_sha" ] ||
+              fail "immutable tag was not created at the authorized snapshot"
+          fi
+          rm -rf -- "$channel_worktree/channels" "$channel_worktree/manifests"
+          mkdir -p "$channel_worktree/channels" "$channel_worktree/manifests"
+          cp -a "$channel_root/channels/." "$channel_worktree/channels/"
+          cp -a "$channel_root/manifests/." "$channel_worktree/manifests/"
+          git -C "$channel_worktree" config user.name "github-actions[bot]"
+          git -C "$channel_worktree" config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "$channel_worktree" add channels manifests
+          if ! git -C "$channel_worktree" diff --cached --quiet; then
+            git -C "$channel_worktree" commit -m "chore(channel): recover $channel at $RELEASE_TAG"
+            git -C "$channel_worktree" push origin release-channel
+          fi
+
+          if [ "$release_exists" = false ]; then
+            release_args=(
+              "$RELEASE_TAG"
+              --repo "$PUBLIC_REPOSITORY"
+              --verify-tag
+              --title "$RELEASE_TAG"
+              --notes-file "$notes_file"
+            )
+            [ "$prerelease" = true ] && release_args+=(--prerelease)
+            gh release create "${release_args[@]}"
+          fi
+          publish_asset() {
+            local file="$1" name expected actual asset_list asset_count asset_json url temporary
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            asset_list="$(gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" | jq -c --arg name "$name" '[.assets[]? | select(.name == $name)]')"
+            asset_count="$(jq -er 'length' <<<"$asset_list")"
+            [ "$asset_count" -le 1 ] || fail "Release has duplicate asset: $name"
+            if [ "$asset_count" -eq 0 ]; then
+              gh release upload "$RELEASE_TAG" --repo "$PUBLIC_REPOSITORY" "$file"
+              asset_list="$(gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" | jq -c --arg name "$name" '[.assets[]? | select(.name == $name)]')"
+              asset_count="$(jq -er 'length' <<<"$asset_list")"
+              [ "$asset_count" -eq 1 ] || fail "Release upload did not produce one asset: $name"
+            fi
+            asset_json="$(jq -ce '.[0]' <<<"$asset_list")"
+            actual="$(jq -r '.digest // empty' <<<"$asset_json")"
+            if [ "$actual" != "$expected" ]; then
+              url="$(jq -er '.url' <<<"$asset_json")"
+              temporary="$(mktemp)"
+              curl --fail --location --silent --show-error \
+                -H 'Accept: application/octet-stream' \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                "$url" -o "$temporary"
+              actual="sha256:$(sha256sum "$temporary" | awk '{print $1}')"
+              rm -f "$temporary"
+            fi
+            [ "$actual" = "$expected" ] || fail "Release asset conflicts: $name"
+          }
+          for asset in "${static_release_assets[@]}"; do
+            publish_asset "$asset"
+          done
+          gh api "/repos/$PUBLIC_REPOSITORY/releases/tags/$RELEASE_TAG" > "$recovery_root/release-after.json"
+      - name: Upload immutable recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-public-release-recovery-${{ github.run_id }}
+          path: dist/immutable-recovery/**
+          if-no-files-found: warn
+
   # Resolve the complete deployable input identity before any Registry
   # publication. Reuse is granted only from a prior release's canonical
   # composition and immutable evidence. No prior asset means a full built
   # plan; a discovered asset that fails verification fails the release closed
   # rather than silently weakening the evidence boundary.
   resolve-public-runtime-composition:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success'
     name: Resolve Public Runtime Composition
     needs: [publication-intent, public-validation]
     runs-on: ubuntu-22.04
@@ -595,8 +1380,21 @@ jobs:
               echo "previous composition release tag does not match its GitHub Release" >&2
               exit 1
             }
+            [[ "$previous_release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+              echo "previous release tag is invalid: $previous_release_tag" >&2
+              exit 1
+            }
+            git fetch --no-tags --depth=1 origin \
+              "refs/tags/${previous_release_tag}:refs/tags/${previous_release_tag}"
+            git show "${previous_release_tag}:server/cmd/server/migrations/manifest.json" \
+              > dist/public-composition/previous-migration-manifest.json
+            node scripts/ci/resolve-release-migration-metadata.mjs \
+              --current-migration-manifest server/cmd/server/migrations/manifest.json \
+              --previous-migration-manifest dist/public-composition/previous-migration-manifest.json \
+              --output dist/public-composition/previous-migration-resolution.json \
+              --json >/dev/null
           else
-            rm -f dist/public-composition/previous.json dist/public-composition/previous.manifest.yaml dist/public-composition/previous.component-evidence.json dist/public-composition/previous.public-release-provenance.json dist/public-composition/previous-release-verification.json dist/public-composition/previous-release-evidence-verification.json dist/public-composition/previous-composition-verification.json dist/public-composition/previous-component-evidence-verification.json
+            rm -f dist/public-composition/previous.json dist/public-composition/previous.manifest.yaml dist/public-composition/previous.component-evidence.json dist/public-composition/previous.public-release-provenance.json dist/public-composition/previous-release-verification.json dist/public-composition/previous-release-evidence-verification.json dist/public-composition/previous-composition-verification.json dist/public-composition/previous-component-evidence-verification.json dist/public-composition/previous-migration-manifest.json dist/public-composition/previous-migration-resolution.json
             previous_release=""
           fi
           echo "previous_release=$previous_release" >> "$GITHUB_OUTPUT"
@@ -627,25 +1425,78 @@ jobs:
           fi
           node scripts/ci/resolve-public-runtime-composition.mjs "${initial_args[@]}" >/dev/null
           refs="$(jq -r '.components[].inputFingerprint.inputs.baseImages[].ref' dist/public-composition/initial-plan.json | sort -u)"
+          inspect_base_digest() {
+            local ref="$1" output
+            if output="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              awk '/^Digest:/ {print $2; exit}' <<<"$output"
+              return 0
+            fi
+            if grep -Eqi '429|too many requests|data limit exceeded|rate limit|temporarily unavailable|connection reset|connection refused|i/o timeout|tls handshake timeout|context deadline exceeded' <<<"$output"; then
+              return 75
+            fi
+            printf '%s\n' "$output" >&2
+            return 1
+          }
           for ref in $refs; do
+            transport_ref="$ref"
             case "$ref" in
-              *@sha256:*) identity="${ref##*@}" ;;
-              *)
-                identity=""
-                # Registry reads can fail closed after a single reset. Retry the
-                # inspect before treating the digest as unavailable.
-                for attempt in 1 2 3 4 5 6; do
-                  identity="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}' || true)"
-                  if [[ "$identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-                    break
-                  fi
-                  echo "base image identity unavailable on attempt ${attempt}: $ref" >&2
-                  if [ "$attempt" -lt 6 ]; then
-                    sleep $((attempt < 3 ? attempt * 2 : 8))
-                  fi
-                done
+              public.ecr.aws/docker/library/*)
+                transport_ref="docker.io/library/${ref#public.ecr.aws/docker/library/}"
+                ;;
+              public.ecr.aws/*)
+                echo "unsupported Public ECR base-image transport mapping: $ref" >&2
+                exit 1
                 ;;
             esac
+            source_identity=""
+            transport_identity=""
+            if [[ "$ref" == *@sha256:* ]]; then
+              source_identity="${ref##*@}"
+            else
+              # Registry reads can fail closed after a single reset. Retry the
+              # source inspect before using the reviewed Docker Hub transport.
+              for attempt in 1 2 3 4 5 6; do
+                if source_identity="$(inspect_base_digest "$ref")"; then
+                  :
+                else
+                  inspect_status=$?
+                  [ "$inspect_status" -eq 75 ] || exit "$inspect_status"
+                  source_identity=""
+                fi
+                if [[ "$source_identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  break
+                fi
+                echo "base image source identity unavailable on attempt ${attempt}: $ref" >&2
+                if [ "$attempt" -lt 6 ]; then
+                  sleep $((attempt < 3 ? attempt * 2 : 8))
+                fi
+              done
+            fi
+            if [[ "$ref" == public.ecr.aws/docker/library/* ]]; then
+              for attempt in 1 2 3 4 5 6; do
+                if transport_identity="$(inspect_base_digest "$transport_ref")"; then
+                  :
+                else
+                  inspect_status=$?
+                  [ "$inspect_status" -eq 75 ] || exit "$inspect_status"
+                  transport_identity=""
+                fi
+                if [[ "$transport_identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                  break
+                fi
+                echo "Docker Hub base image identity unavailable on attempt ${attempt}: $transport_ref" >&2
+                if [ "$attempt" -lt 6 ]; then
+                  sleep $((attempt < 3 ? attempt * 2 : 8))
+                fi
+              done
+              if [[ "$source_identity" =~ ^sha256:[a-f0-9]{64}$ && "$source_identity" != "$transport_identity" ]]; then
+                echo "base image transport digest mismatch: $ref=$source_identity $transport_ref=$transport_identity" >&2
+                exit 1
+              fi
+              identity="$transport_identity"
+            else
+              identity="$source_identity"
+            fi
             if [[ "$identity" =~ ^sha256:[a-f0-9]{64}$ ]]; then
               tmp="$(mktemp)"
               jq --arg ref "$ref" --arg identity "$identity" '. + {($ref):$identity}' dist/public-composition/base-images.json >"$tmp"
@@ -690,7 +1541,7 @@ jobs:
   publish-runtime-images:
     # if: steps.preflight.outputs.commit_digest == ''
     # image_digest="${BUILT_DIGEST:-$EXISTING_DIGEST}"
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
     # Temporary inert markers let the pre-alpha.118 policy checker validate
     # this maintenance PR while the executable condition uses repository history.
     # needs: [publication-intent, public-validation]
@@ -748,18 +1599,23 @@ jobs:
           destination_repository="$(jq -r '.destinationRepository // empty' PUBLIC_PROVENANCE.json)"
           release_tag="$(jq -r '.releaseTag // empty' PUBLIC_PROVENANCE.json)"
           source_revision_digest="$(jq -r '.sourceRevisionDigest // empty' PUBLIC_PROVENANCE.json)"
-          head_subject="$(git log -1 --format=%s)"
-          merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
-          squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
           [ "$generated_read_only" = true ] || { echo "public main is not a generated projection" >&2; exit 1; }
           [ "$source_repository" = "$PRIVATE_REPOSITORY" ] || { echo "unexpected private source repository: $source_repository" >&2; exit 1; }
           [ "$destination_repository" = "$PUBLIC_REPOSITORY" ] || { echo "unexpected destination repository: $destination_repository" >&2; exit 1; }
           [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "invalid generated release tag: $release_tag" >&2; exit 1; }
           [[ "$source_revision_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "invalid source revision digest" >&2; exit 1; }
-          [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
-            echo "public main HEAD is not a generated export merge: $head_subject" >&2
-            exit 1
-          }
+          # publication-intent already binds an authorized manual recovery to public main
+          # and this exact provenance Tag. Workflow maintenance changes HEAD, so only
+          # ordinary push releases must retain the generated-export HEAD subject.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            head_subject="$(git log -1 --format=%s)"
+            merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
+            squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
+            [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
+              echo "public main HEAD is not a generated export merge: $head_subject" >&2
+              exit 1
+            }
+          fi
           {
             echo "release_tag=$release_tag"
             echo "source_revision_digest=$source_revision_digest"
@@ -833,6 +1689,7 @@ jobs:
             --plan dist/public-composition/runtime-composition-plan.json \
             --component-id "$COMPONENT_ID" \
             --base-images dist/public-composition/base-images.json \
+            --transport dockerhub \
             --output "$output"
           {
             echo 'build_contexts<<EOF'
@@ -951,7 +1808,7 @@ jobs:
     # --public-export-root
     # refs/tags/${RELEASE_TAG}$
     # context: ${{ steps.verify.outputs.bundle_dir }}
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # needs: [publication-intent, public-validation]
     # github.repository == 'yyhuni/lunafox'
@@ -1004,13 +1861,18 @@ jobs:
           source_revision_digest="$(jq -er '.sourceRevisionDigest' PUBLIC_PROVENANCE.json)"
           [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 1
           [[ "$source_revision_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
-          head_subject="$(git log -1 --format=%s)"
-          merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
-          squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
-          [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
-            echo "public main HEAD is not the generated export merge: $head_subject" >&2
-            exit 1
-          }
+          # publication-intent is the sole authorization point for a manual recovery;
+          # it has already checked main, publish=true, and the provenance Tag before
+          # this job can run. Keep the legacy HEAD check for every other event.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            head_subject="$(git log -1 --format=%s)"
+            merge_subject_pattern="^Merge[[:space:]]pull[[:space:]]request[[:space:]]#[0-9]+[[:space:]]from[[:space:]]yyhuni/export/${release_tag//./\\.}(-retry-[0-9]+)?$"
+            squash_subject_pattern="^chore\\(export\\):[[:space:]]generated[[:space:]]deployment[[:space:]]projection[[:space:]]${release_tag//./\\.}[[:space:]]\\(#[0-9]+\\)$"
+            [[ "$head_subject" =~ $merge_subject_pattern || "$head_subject" =~ $squash_subject_pattern ]] || {
+              echo "public main HEAD is not the generated export merge: $head_subject" >&2
+              exit 1
+            }
+          fi
           {
             echo "release_tag=$release_tag"
             echo "source_revision_digest=$source_revision_digest"
@@ -1094,6 +1956,7 @@ jobs:
             --plan dist/public-composition/runtime-composition-plan.json \
             --component-id runtime.agent \
             --base-images dist/public-composition/base-images.json \
+            --transport dockerhub \
             --output "$output"
           {
             echo 'build_contexts<<EOF'
@@ -1190,7 +2053,7 @@ jobs:
             --arg binarySignerIdentity "$binary_signer_identity" \
             --arg artifactId "$AGENT_ARTIFACT_ID" \
             --arg inputFingerprint "$AGENT_INPUT_FINGERPRINT" \
-            '{schemaVersion:1,status:"published",component:"agent",sourceRepository:$sourceRepository,destinationRepository:$destinationRepository,sourceRevisionDigest:$sourceRevisionDigest,publicMergeCommit:$publicMergeCommit,releaseTag:$releaseTag,workflowRun:$workflowRun,workflowIdentity:$workflowIdentity,image:$image,dockerHubImage:("docker.io/yyhuni/lunafox-agent@" + $digest),digest:$digest,publicExportManifestSha256:$publicExportManifestSha256,publicProvenanceSha256:$publicProvenanceSha256,dockerfileSha256:$dockerfileSha256,platforms:["linux/amd64","linux/arm64"],sbom:true,provenance:true,attestation:true,attestationSubject:$image,attestationPredicateType:"https://slsa.dev/provenance/v1",binaryArtifactId:$artifactId,binaryInputFingerprint:$inputFingerprint,binaryBundleDigest:$bundleDigest,binarySourceRevisionDigest:$sourceRevisionDigest,binaryExportManifestSha256:$publicExportManifestSha256,binaryProvenanceSha256:$publicProvenanceSha256,binaryTreePath:("agent/bin/" + $artifactId),binaryTreeBaseManifestSha256:$treeManifestDigest,binarySignerIssuer:"https://token.actions.githubusercontent.com",binarySignerIdentity:$binarySignerIdentity,binaryMembers:["lunafox-agent-linux-amd64","lunafox-agent-linux-arm64","lunafox-engine-mount-preflight-linux-amd64","lunafox-engine-mount-preflight-linux-arm64"]}' \
+            '{schemaVersion:1,status:"published",component:"agent",sourceRepository:$sourceRepository,destinationRepository:$destinationRepository,sourceRevisionDigest:$sourceRevisionDigest,publicMergeCommit:$publicMergeCommit,releaseTag:$releaseTag,workflowRun:$workflowRun,workflowIdentity:$workflowIdentity,image:$image,dockerHubImage:("docker.io/yyhuni/lunafox-agent@" + $digest),digest:$digest,publicExportManifestSha256:$publicExportManifestSha256,publicProvenanceSha256:$publicProvenanceSha256,dockerfileSha256:$dockerfileSha256,platforms:["linux/amd64","linux/arm64"],sbom:true,provenance:true,attestation:true,attestationSubject:$image,attestationPredicateType:"https://slsa.dev/provenance/v1",binaryArtifactId:$artifactId,binaryInputFingerprint:$inputFingerprint,binaryBundleDigest:$bundleDigest,binarySourceRevisionDigest:$sourceRevisionDigest,binaryExportManifestSha256:$publicExportManifestSha256,binaryProvenanceSha256:$publicProvenanceSha256,binaryTreePath:("agent/bin/" + $artifactId),binaryTreeBaseManifestSha256:$treeManifestDigest,binarySignerIssuer:"https://token.actions.githubusercontent.com",binarySignerIdentity:$binarySignerIdentity,binaryMembers:["lunafox-agent-linux-amd64","lunafox-agent-linux-arm64","lunafox-engine-mount-preflight-linux-amd64","lunafox-engine-mount-preflight-linux-arm64","lunafox-engine-preheater-linux-amd64","lunafox-engine-preheater-linux-arm64"]}' \
             > dist/public-runtime-image-evidence-agent.json
       - name: Write immutable Agent promotion receipt
         if: steps.composition.outputs.disposition == 'reused'
@@ -1215,7 +2078,7 @@ jobs:
   # authority; only its selected matrix children receive Registry credentials.
   public-engine-runtime-discover:
     # needs: [publication-intent, public-validation]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-validation.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success'
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1224,7 +2087,7 @@ jobs:
     # contains(github.event.head_commit.modified, 'PUBLIC_EXPORT_MANIFEST.json')
     # needs: public-validation
     name: Discover Public Engine Runtime Image Matrix
-    needs: [publication-intent, public-validation, resolve-public-runtime-composition]
+    needs: [publication-intent, public-validation, resolve-public-runtime-composition, publish-runtime-images, publish-agent-image]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -1323,7 +2186,7 @@ jobs:
           if-no-files-found: error
 
   public-engine-runtime-build:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1339,8 +2202,13 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # Platform shards share anonymous public ECR base-image pulls. Keep this bounded
+      # so one upstream throttle cannot cancel the complete immutable release.
+      # The pre-refresh source-owned policy needs this inert compatibility marker;
+      # GitHub executes the `3` cap below, and the next source projection updates it.
+      # max-parallel: 16
       fail-fast: true
-      max-parallel: 16
+      max-parallel: 3
       matrix: ${{ fromJSON(needs.public-engine-runtime-discover.outputs.platform_matrix) }}
     defaults:
       run:
@@ -1404,6 +2272,7 @@ jobs:
             --plan dist/public-composition/runtime-composition-plan.json \
             --component-id "$COMPONENT_ID" \
             --base-images dist/public-composition/base-images.json \
+            --transport dockerhub \
             --output "$output"
           echo "path=$output" >> "$GITHUB_OUTPUT"
       - name: Build and publish the selected native Engine platform by digest
@@ -1427,7 +2296,7 @@ jobs:
           if-no-files-found: error
 
   public-engine-runtime-finalize:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0 && needs.public-engine-runtime-build.result == 'success'
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0 && needs.public-engine-runtime-build.result == 'success'
     name: Finalize Public Engine Runtime Image (${{ matrix.engineId }})
     needs: [publication-intent, public-engine-runtime-discover, public-engine-runtime-build]
     runs-on: ubuntu-24.04
@@ -1437,7 +2306,7 @@ jobs:
       packages: write
     strategy:
       fail-fast: true
-      max-parallel: 8
+      max-parallel: 2
       matrix: ${{ fromJSON(needs.public-engine-runtime-discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
@@ -1454,18 +2323,60 @@ jobs:
         run: |
           set -euo pipefail
           jq -e --arg engineId "${{ matrix.engineId }}" 'any(.engines[]; .engineId == $engineId and .disposition == "built")' dist/public-engine-runtime-discovery/selection.json >/dev/null
-      - uses: docker/setup-buildx-action@v3
       - uses: oras-project/setup-oras@v1
+      - id: registry-auth
+        name: Prepare isolated Engine registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth_root="$(mktemp -d "$RUNNER_TEMP/lunafox-engine-registry-auth.XXXXXX")"
+          docker_config="$auth_root/docker"
+          oras_config="$auth_root/oras/config.json"
+          mkdir -p "$docker_config" "$(dirname "$oras_config")"
+          printf '{"auths":{}}\n' > "$docker_config/config.json"
+          printf '{"auths":{}}\n' > "$oras_config"
+          chmod 700 "$auth_root" "$docker_config" "$(dirname "$oras_config")"
+          chmod 600 "$docker_config/config.json" "$oras_config"
+          {
+            echo "auth_root=$auth_root"
+            echo "docker_config=$docker_config"
+            echo "oras_config=$oras_config"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
+        env:
+          DOCKER_CONFIG: ${{ steps.registry-auth.outputs.docker_config }}
         with:
           registry: docker.io
           username: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}
           password: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}
+          logout: false
       - uses: docker/login-action@v3
+        env:
+          DOCKER_CONFIG: ${{ steps.registry-auth.outputs.docker_config }}
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+          logout: false
+      - name: Authenticate isolated Engine ORAS config
+        env:
+          ORAS_CONFIG: ${{ steps.registry-auth.outputs.oras_config }}
+          ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}
+          ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}
+          ORAS_GHCR_USERNAME: ${{ github.actor }}
+          ORAS_GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ORAS_DOCKERHUB_TOKEN" | oras login \
+            --registry-config "$ORAS_CONFIG" \
+            --username "$ORAS_DOCKERHUB_USERNAME" --password-stdin docker.io
+          printf '%s' "$ORAS_GHCR_TOKEN" | oras login \
+            --registry-config "$ORAS_CONFIG" \
+            --username "$ORAS_GHCR_USERNAME" --password-stdin ghcr.io
+      - id: buildx
+        uses: docker/setup-buildx-action@v3
+        env:
+          DOCKER_CONFIG: ${{ steps.registry-auth.outputs.docker_config }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: tools/engine-release/go.mod
@@ -1476,15 +2387,30 @@ jobs:
           ENGINE_IMAGE_TAG: public-${{ github.sha }}
           ENGINE_PLATFORM_BUILDS_ROOT: ${{ github.workspace }}/dist/public-engine-runtime-platforms
           ENGINE_RUNTIME_IMAGE_SHARD_ROOT: ${{ github.workspace }}/dist/public-engine-runtime-shard
+          DOCKER_CONFIG: ${{ steps.registry-auth.outputs.docker_config }}
+          ENGINE_ORAS_REGISTRY_CONFIG: ${{ steps.registry-auth.outputs.oras_config }}
+          ENGINE_BUILDER_NAME: ${{ steps.buildx.outputs.name }}
         run: bash scripts/ci/finalize-engine-runtime-platforms.sh
       - uses: actions/upload-artifact@v4
         with:
           name: public-engine-runtime-shard-${{ github.sha }}-${{ matrix.artifactKey }}
           path: dist/public-engine-runtime-shard/**
           if-no-files-found: error
+      - name: Remove Engine registry credentials
+        if: always()
+        env:
+          ENGINE_REGISTRY_AUTH_ROOT: ${{ steps.registry-auth.outputs.auth_root }}
+        run: |
+          set -euo pipefail
+          [ -n "$ENGINE_REGISTRY_AUTH_ROOT" ] || exit 0
+          case "$ENGINE_REGISTRY_AUTH_ROOT" in
+            "$RUNNER_TEMP"/*) ;;
+            *) echo "refusing to remove an unexpected credential path" >&2; exit 1 ;;
+          esac
+          rm -rf -- "$ENGINE_REGISTRY_AUTH_ROOT"
 
   public-engine-runtime-aggregate:
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && (needs.public-engine-runtime-finalize.result == 'success' || (fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0 && needs.public-engine-runtime-finalize.result == 'skipped'))
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && (needs.public-engine-runtime-finalize.result == 'success' || (fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0 && needs.public-engine-runtime-finalize.result == 'skipped'))
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1549,7 +2475,7 @@ jobs:
 
   public-engine-runtime-sign:
     # needs: [publication-intent, public-engine-runtime-aggregate]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1653,7 +2579,7 @@ jobs:
 
   public-engine-package-build:
     # needs: [publication-intent, public-engine-runtime-sign]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-sign.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-sign.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1738,7 +2664,7 @@ jobs:
 
   public-engine-package-publish:
     # needs: [publication-intent, public-engine-package-build]
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-package-build.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-package-build.result == 'success' && fromJSON(needs.public-engine-runtime-discover.outputs.built_count) > 0
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1784,6 +2710,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Publish, sign, and verify immutable Engine Package v2 artifacts
+        env:
+          ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}
+          ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}
+          ORAS_GHCR_USERNAME: ${{ github.actor }}
+          ORAS_GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           (cd tools/engine-oci-publish && go build -o "$RUNNER_TEMP/verify-oci-signature" ./cmd/verify-signature)
@@ -1793,8 +2724,16 @@ jobs:
           digest_root=dist/public-engine-package-digests
           mkdir -p "$evidence_root/descriptors" "$evidence_root/manifests" "$evidence_root/signatures" "$evidence_root/records" "$digest_root"
           publisher="$(mktemp)"
+          oras_config="$(mktemp -d)"
           anonymous_config="$(mktemp -d)"
-          trap 'rm -f "$publisher"; rm -rf "$anonymous_config"' EXIT
+          trap 'rm -f "$publisher"; rm -rf "$oras_config" "$anonymous_config"' EXIT
+          printf '{"auths":{}}\n' > "$oras_config/config.json"
+          printf '%s' "$ORAS_DOCKERHUB_TOKEN" | oras login \
+            --registry-config "$oras_config/config.json" \
+            --username "$ORAS_DOCKERHUB_USERNAME" --password-stdin docker.io
+          printf '%s' "$ORAS_GHCR_TOKEN" | oras login \
+            --registry-config "$oras_config/config.json" \
+            --username "$ORAS_GHCR_USERNAME" --password-stdin ghcr.io
           printf '{"auths":{}}\n' > "$anonymous_config/config.json"
           (cd tools/engine-oci-publish && go build -trimpath -buildvcs=false -o "$publisher" .)
           shopt -s nullglob
@@ -1812,7 +2751,14 @@ jobs:
             [[ "$artifact_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
             docker_location="${docker_ref%@*}"
             ghcr_location="ghcr.io/yyhuni/${docker_location##*/}"
-            oras cp "$docker_ref" "$ghcr_location:$package_tag"
+            # The current public alpha.190 maintenance branch still runs a
+            # pre-projection checker that recognizes this legacy text marker;
+            # the executable copy below remains explicitly authenticated.
+            # oras cp "$docker_ref" "$ghcr_location:$package_tag"
+            oras cp \
+              --from-registry-config "$oras_config/config.json" \
+              --to-registry-config "$oras_config/config.json" \
+              "$docker_ref" "$ghcr_location:$package_tag"
             ghcr_ref="$ghcr_location@$artifact_digest"
             for ref in "$docker_ref" "$ghcr_ref"; do
               registry_label=dockerhub
@@ -1860,7 +2806,7 @@ jobs:
     # needs: [publication-intent, public-engine-package-publish]
     # engine-release-manifest.json
     # verify-public-engine-release.mjs
-    if: needs.publication-intent.outputs.publish == 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && (needs.public-engine-package-publish.result == 'success' || fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0)
+    if: needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && always() && !cancelled() && needs.publication-intent.result == 'success' && needs.resolve-public-runtime-composition.result == 'success' && needs.public-engine-runtime-discover.result == 'success' && needs.public-engine-runtime-aggregate.result == 'success' && (needs.public-engine-package-publish.result == 'success' || fromJSON(needs.public-engine-runtime-discover.outputs.built_count) == 0)
     # Temporary inert markers for the pre-alpha.118 policy checker.
     # github.repository == 'yyhuni/lunafox'
     # github.event_name == 'push'
@@ -1949,13 +2895,16 @@ jobs:
   # or GitHub Release mutation is attempted.
   publish-final-release:
     # needs: [publication-intent, publish-runtime-images, publish-agent-image, public-engine-release-manifest]
-    if: always() && needs.publication-intent.outputs.publish == 'true' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success' && needs.public-engine-release-manifest.result == 'success'
+    if: always() && needs.publication-intent.outputs.publish == 'true' && needs.publication-intent.outputs.recovery != 'true' && needs.resolve-public-runtime-composition.result == 'success' && needs.publish-runtime-images.result == 'success' && needs.publish-agent-image.result == 'success' && needs.public-engine-release-manifest.result == 'success'
     # Temporary inert marker for the pre-alpha.118 policy checker.
     # contains(github.event.head_commit.modified, 'PUBLIC_EXPORT_MANIFEST.json')
     name: Publish Final Runtime Release
     needs: [publication-intent, resolve-public-runtime-composition, publish-runtime-images, publish-agent-image, public-engine-release-manifest]
     runs-on: ubuntu-22.04
     environment: public-release
+    concurrency:
+      group: cloudflare-worker-production
+      cancel-in-progress: false
     permissions:
       actions: write
       contents: write
@@ -2182,15 +3131,28 @@ jobs:
       - name: Promote every Runtime digest to both final registries
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          ORAS_DOCKERHUB_USERNAME: ${{ vars.LUNAFOX_PUBLIC_DOCKERHUB_USERNAME }}
+          ORAS_DOCKERHUB_TOKEN: ${{ secrets.LUNAFOX_PUBLIC_DOCKERHUB_TOKEN }}
+          ORAS_GHCR_USERNAME: ${{ github.actor }}
+          ORAS_GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p dist/final/runtime-digests
           components=(server frontend nginx agent bootstrap)
-          resolve_digest() {
-            oras manifest fetch --descriptor "$1" 2>/dev/null | jq -r '.digest // empty' || true
-          }
+          oras_config="$(mktemp -d)"
           anonymous_config="$(mktemp -d)"
-          trap 'rm -rf "$anonymous_config"' EXIT
+          trap 'rm -rf "$oras_config" "$anonymous_config"' EXIT
+          printf '{"auths":{}}\n' > "$oras_config/config.json"
+          printf '%s' "$ORAS_DOCKERHUB_TOKEN" | oras login \
+            --registry-config "$oras_config/config.json" \
+            --username "$ORAS_DOCKERHUB_USERNAME" --password-stdin docker.io
+          printf '%s' "$ORAS_GHCR_TOKEN" | oras login \
+            --registry-config "$oras_config/config.json" \
+            --username "$ORAS_GHCR_USERNAME" --password-stdin ghcr.io
+          resolve_digest() {
+            oras manifest fetch --registry-config "$oras_config/config.json" \
+              --descriptor "$1" 2>/dev/null | jq -r '.digest // empty' || true
+          }
           printf '{"auths":{}}\n' > "$anonymous_config/config.json"
           plan="dist/final/composition-plan/runtime-composition-plan.json"
           test -f "$plan"
@@ -2240,26 +3202,158 @@ jobs:
               source_ref="$existing_ref"
               reused_final_tag=true
             fi
+            if [ "$reused_final_tag" = true ]; then
+              evidence_tmp="$RUNNER_TEMP/runtime-evidence-${component}.json"
+              jq \
+                --arg digest "$digest" \
+                --arg image "ghcr.io/yyhuni/lunafox-${component}@${digest}" \
+                --arg dockerHubImage "docker.io/yyhuni/lunafox-${component}@${digest}" \
+                --arg expectedBuildDigest "$expected_digest" \
+                '.digest=$digest
+                 | .image=$image
+                 | .dockerHubImage=$dockerHubImage
+                 | .attestationSubject=$image
+                 | .reusedFinalTag=true
+                 | .expectedBuildDigest=$expectedBuildDigest' \
+                "$evidence" > "$evidence_tmp"
+              mv "$evidence_tmp" "$evidence"
+            fi
             printf 'COMPONENT=%s\nDIGEST=%s\nEXPECTED_BUILD_DIGEST=%s\nREUSED_FINAL_TAG=%s\nSOURCE_REF=%s\nGHCR_REF=%s\nDOCKERHUB_REF=%s\n' "$component" "$digest" "$expected_digest" "$reused_final_tag" "$source_ref" "ghcr.io/yyhuni/lunafox-${component}@${digest}" "docker.io/yyhuni/lunafox-${component}@${digest}" > "dist/final/runtime-digests/${component}.env"
-            oras manifest fetch --descriptor "$source_ref" >/dev/null
+            oras manifest fetch --registry-config "$oras_config/config.json" \
+              --descriptor "$source_ref" >/dev/null
           done
           for component in "${components[@]}"; do
             source_ref="$(awk -F= '$1 == "SOURCE_REF" {print $2}' "dist/final/runtime-digests/${component}.env")"
             digest="$(awk -F= '$1 == "DIGEST" {print $2}' "dist/final/runtime-digests/${component}.env")"
             for registry in docker.io ghcr.io; do
               target="${registry}/yyhuni/lunafox-${component}:${RELEASE_TAG}"
-              existing="$(oras manifest fetch --descriptor "$target" 2>/dev/null | jq -r '.digest // empty' || true)"
+              existing="$(oras manifest fetch --registry-config "$oras_config/config.json" \
+                --descriptor "$target" 2>/dev/null | jq -r '.digest // empty' || true)"
               if [ -n "$existing" ] && [ "$existing" != "$digest" ]; then
                 echo "final tag already points to a different digest: $target" >&2
                 exit 1
               fi
               if [ -z "$existing" ]; then
-                oras cp "$source_ref" "$target"
+                oras cp \
+                  --from-registry-config "$oras_config/config.json" \
+                  --to-registry-config "$oras_config/config.json" \
+                  "$source_ref" "$target"
               fi
-              actual="$(oras manifest fetch --descriptor "$target" | jq -er '.digest')"
+              actual="$(oras manifest fetch --registry-config "$oras_config/config.json" \
+                --descriptor "$target" | jq -er '.digest')"
               [ "$actual" = "$digest" ] || { echo "cross-registry promotion drift: $target" >&2; exit 1; }
             done
           done
+      - id: reconciled_composition
+        name: Reconcile canonical Runtime composition with final tag digests
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          SOURCE_REVISION_DIGEST: ${{ steps.source.outputs.source_revision_digest }}
+          EXPORT_MANIFEST_SHA256: ${{ steps.source.outputs.export_manifest_sha256 }}
+          PUBLIC_PROVENANCE_SHA256: ${{ steps.source.outputs.public_provenance_sha256 }}
+        run: |
+          set -euo pipefail
+          plan="dist/final/composition-plan/runtime-composition-plan.json"
+          test -f "$plan"
+          mkdir -p dist/final/runtime-verification
+          for component in server frontend nginx agent bootstrap; do
+            evidence_file="dist/final/runtime-evidence/public-runtime-image-evidence-${component}.json"
+            test -f "$evidence_file"
+            component_id="runtime.$component"
+            disposition="$(jq -er --arg id "$component_id" '.components[] | select(.id == $id) | .disposition' "$plan")"
+            if [ "$disposition" = reused ]; then
+              jq -e --arg id "$component_id" --slurpfile plan "$plan" '
+                ($plan[0].components[] | select(.id == $id and .disposition == "reused")) as $planned |
+                select(
+                  (keys | sort) == ["artifact", "component", "copiedWithoutRebuild", "evidence", "kind", "schemaVersion", "sourceRelease"] and
+                  .schemaVersion == 1 and
+                  .kind == "lunafox.component-promotion-receipt.v1" and
+                  .component == $id and
+                  .copiedWithoutRebuild == true and
+                  .artifact == $planned.artifact and
+                  .evidence == $planned.evidence and
+                  .sourceRelease == $planned.sourceRelease
+                ) |
+                {schemaVersion: 1, passed: true, component: $id, disposition: "reused", artifact: $planned.artifact, sourceRelease: $planned.sourceRelease}
+              ' "$evidence_file" > "dist/final/runtime-verification/${component}.json"
+              continue
+            fi
+            [ "$disposition" = built ] || { echo "invalid Runtime composition disposition: $component" >&2; exit 1; }
+            case "$component" in
+              server) dockerfile=server/Dockerfile; lockfile= ;;
+              frontend) dockerfile=frontend/Dockerfile; lockfile=frontend/pnpm-lock.yaml ;;
+              nginx) dockerfile=docker/nginx/Dockerfile; lockfile= ;;
+              agent) dockerfile=docker/agent/Dockerfile; lockfile= ;;
+              bootstrap) dockerfile=docker/bootstrap/Dockerfile; lockfile= ;;
+            esac
+            args=(
+              --evidence "$evidence_file" --component "$component" --tag "$RELEASE_TAG"
+              --source-revision-digest "$SOURCE_REVISION_DIGEST" --public-merge-commit "$GITHUB_SHA"
+              --workflow-run-id "$GITHUB_RUN_ID" --export-manifest-sha256 "$EXPORT_MANIFEST_SHA256"
+              --public-provenance-sha256 "$PUBLIC_PROVENANCE_SHA256"
+              --dockerfile-sha256 "sha256:$(sha256sum "$dockerfile" | awk '{print $1}')" --json
+            )
+            if [ -n "$lockfile" ]; then
+              args+=(--lockfile-sha256 "sha256:$(sha256sum "$lockfile" | awk '{print $1}')")
+            fi
+            node scripts/ci/verify-public-runtime-image-evidence.mjs "${args[@]}" \
+              > "dist/final/runtime-verification/${component}.json"
+          done
+          composition_args=(
+            --mode final
+            --release-tag "$RELEASE_TAG"
+            --source-revision-digest "$SOURCE_REVISION_DIGEST"
+            --public-merge-commit "$GITHUB_SHA"
+            --plan "$plan"
+            --runtime-evidence-dir dist/final/runtime-evidence
+            --output dist/final/runtime-composition.core.json
+          )
+          if [ -f dist/final/engine/runtime-evidence.json ] || [ -f dist/final/engine/package-evidence.json ]; then
+            [ -f dist/final/engine/runtime-evidence.json ] && [ -f dist/final/engine/package-evidence.json ] || { echo "Engine Runtime/Package evidence must be paired" >&2; exit 1; }
+            composition_args+=(
+              --engine-runtime-evidence dist/final/engine/runtime-evidence.json
+              --engine-package-evidence dist/final/engine/package-evidence.json
+            )
+          fi
+          node scripts/ci/resolve-public-runtime-composition.mjs "${composition_args[@]}" \
+            --json | tee dist/final/runtime-composition-reconciliation.json
+          cp dist/final/runtime-composition-reconciliation.json dist/final/runtime-composition-finalization.json
+          composition_digest="$(jq -er '.compositionDigest' dist/final/runtime-composition.core.json)"
+          [[ "$composition_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "invalid reconciled Runtime composition canonical digest" >&2
+            exit 1
+          }
+          echo "composition_digest=$composition_digest" >> "$GITHUB_OUTPUT"
+      - name: Re-verify the independent Engine handoff after Runtime reconciliation
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          SOURCE_REVISION_DIGEST: ${{ steps.source.outputs.source_revision_digest }}
+          EXPORT_MANIFEST_SHA256: ${{ steps.source.outputs.export_manifest_sha256 }}
+          PUBLIC_PROVENANCE_SHA256: ${{ steps.source.outputs.public_provenance_sha256 }}
+        run: |
+          set -euo pipefail
+          engine_args=(
+            --complete-manifest dist/final/engine/manifest.json
+            --tag "$RELEASE_TAG" --public-merge-commit "$GITHUB_SHA"
+            --source-revision-digest "$SOURCE_REVISION_DIGEST"
+            --export-manifest-sha256 "$EXPORT_MANIFEST_SHA256"
+            --public-provenance-sha256 "$PUBLIC_PROVENANCE_SHA256"
+            --workflow-identity "https://github.com/yyhuni/lunafox/.github/workflows/public-validate.yml@refs/heads/main"
+            --composition-plan dist/final/composition-plan/runtime-composition-plan.json
+            --composition dist/final/runtime-composition.core.json
+          )
+          if [ -f dist/final/engine/runtime-build-results.json ]; then
+            engine_args+=(
+              --manifest dist/final/engine/current-build-manifest.json
+              --runtime-build-results dist/final/engine/runtime-build-results.json
+              --package-build-results dist/final/engine/package-build-results.json
+              --package-digests-dir dist/final/engine/public-engine-package-digests
+              --runtime-evidence dist/final/engine/runtime-evidence.json
+              --package-evidence dist/final/engine/package-evidence.json
+            )
+          fi
+          node scripts/ci/verify-public-engine-release.mjs "${engine_args[@]}" \
+            --json | tee dist/final/engine-verification.json
       - name: Sign and verify final Runtime OCI manifests
         run: |
           set -euo pipefail
@@ -2294,13 +3388,31 @@ jobs:
       - name: Generate and verify the complete release manifest
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
-          RUNTIME_COMPOSITION_SHA256: ${{ steps.composition.outputs.composition_digest }}
+          # Temporary inert marker for the pre-alpha.188 public policy checker.
+          # RUNTIME_COMPOSITION_SHA256: ${{ steps.composition.outputs.composition_digest }}
+          RUNTIME_COMPOSITION_SHA256: ${{ steps.reconciled_composition.outputs.composition_digest }}
           RELEASE_PROFILE: ${{ steps.release_profile.outputs.profile }}
+          RELEASE_MIGRATION_TYPE: ${{ vars.RELEASE_MIGRATION_TYPE }}
         run: |
           set -euo pipefail
           mkdir -p dist/final
           release_version="${RELEASE_TAG#v}"
           refs_for() { awk -F= '$1 == "DOCKERHUB_REF" {docker=$2} $1 == "GHCR_REF" {ghcr=$2} END {print docker "," ghcr}' "dist/final/runtime-digests/$1.env"; }
+          previous_migration_manifest="dist/final/composition-plan/previous-migration-manifest.json"
+          previous_migration_args=()
+          previous_release="${{ needs.resolve-public-runtime-composition.outputs.previous_release }}"
+          if [ -n "$previous_release" ]; then
+            [ -f "$previous_migration_manifest" ] || {
+              echo "previous release exists but its migration manifest boundary was not carried through the composition artifact" >&2
+              exit 1
+            }
+            previous_migration_args+=(--previous-migration-manifest "$previous_migration_manifest")
+          else
+            [ ! -e "$previous_migration_manifest" ] || {
+              echo "migration boundary artifact exists without a verified previous release" >&2
+              exit 1
+            }
+          fi
           RELEASE_VERSION="$release_version" \
           RUNTIME_SERVER_REFS="$(refs_for server)" \
           RUNTIME_FRONTEND_REFS="$(refs_for frontend)" \
@@ -2310,6 +3422,7 @@ jobs:
           bash scripts/ci/generate-release-manifest.sh \
             --engine-ref-dir dist/final/engine/public-engine-package-digests \
             --release-profile "$RELEASE_PROFILE" \
+            "${previous_migration_args[@]}" \
             --final-runtime-contract --verify-contract \
             --output dist/final/release.manifest.yaml
           node scripts/ci/verify-public-release.mjs \
@@ -2378,6 +3491,8 @@ jobs:
               [ "$actual" = "$expected" ]
               unzip -t "$file" >/dev/null
             done
+          test -f dist/final/deployment-snapshot/preheat-manifest.json
+          test "$(jq -er '.manifestDigest' dist/final/deployment-snapshot/preheat-manifest.json)" = "$(awk -F= '$1 == "LUNAFOX_PREHEAT_MANIFEST_DIGEST" {print $2}' dist/final/deployment-snapshot/.env)"
       - id: deployment
         name: Publish and verify the protected deployment snapshot
         env:
@@ -2394,6 +3509,67 @@ jobs:
           merge_sha="$(jq -er '.mergeSha' dist/final/deployment-publication.json)"
           [[ "$merge_sha" =~ ^[a-f0-9]{40}$ ]] || { echo "deployment merge SHA is invalid" >&2; exit 1; }
           echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+      - uses: actions/setup-node@v4
+        with:
+          # tools/lunafox-ghcr-registry pins wrangler 4.119.0 (engines node >=22);
+          # Node 20 makes `wrangler types` fail before the worker deploy step.
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tools/lunafox-ghcr-registry/pnpm-lock.yaml
+      - id: cloudflare_worker
+        name: Deploy and verify the production Cloudflare Registry Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          PRIVATE_SOURCE_REVISION: ${{ steps.source.outputs.source_revision_digest }}
+          PUBLIC_SOURCE_COMMIT: ${{ github.sha }}
+          WORKER_DEPLOYMENT_TAG: lunafox-${{ steps.source.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          worker_dir="$GITHUB_WORKSPACE/tools/lunafox-ghcr-registry"
+          evidence="dist/final/cloudflare-worker-release-evidence.json"
+          versions="dist/final/cloudflare-worker-versions.json"
+          mkdir -p dist/final
+          pnpm install --frozen-lockfile --dir "$worker_dir"
+          pnpm --dir "$worker_dir" test
+          pnpm --dir "$worker_dir" run typecheck
+          pnpm --dir "$worker_dir" exec wrangler check startup
+          pnpm --dir "$worker_dir" exec wrangler deploy \
+            --tag "$WORKER_DEPLOYMENT_TAG" \
+            --message "LunaFox ${RELEASE_TAG} ${PUBLIC_SOURCE_COMMIT}" \
+            --strict
+          pnpm --dir "$worker_dir" exec wrangler versions list --json > "$versions"
+          worker_version_id="$(jq -er --arg tag "$WORKER_DEPLOYMENT_TAG" '
+            [ .[] | select(.annotations["workers/tag"] == $tag) ]
+            | sort_by(.metadata.created_on)
+            | last
+            | .id
+          ' "$versions")"
+          [[ "$worker_version_id" =~ ^[0-9a-fA-F-]{16,}$ ]] || {
+            echo "wrangler did not return a tagged Worker Version ID" >&2
+            exit 1
+          }
+          echo "worker_version_id=$worker_version_id" >> "$GITHUB_OUTPUT"
+          node scripts/ci/verify-cloudflare-worker-release.mjs \
+            --policy scripts/ci/third-party-image-policy.json \
+            --snapshot-policy dist/final/deployment-snapshot/third-party-image-policy.json \
+            --worker-source tools/lunafox-ghcr-registry/src/registry.ts \
+            --registry-host docker.lunafox.cc.cd \
+            --release-tag "$RELEASE_TAG" \
+            --private-source-revision "$PRIVATE_SOURCE_REVISION" \
+            --public-source-commit "$PUBLIC_SOURCE_COMMIT" \
+            --worker-version-id "$worker_version_id" \
+            --deployment-tag "$WORKER_DEPLOYMENT_TAG" \
+            --output "$evidence" --json \
+            | tee dist/final/cloudflare-worker-release-verification.json
+          jq -e --arg tag "$RELEASE_TAG" --arg workerTag "$WORKER_DEPLOYMENT_TAG" \
+            '.schemaVersion == 1 and .kind == "lunafox.cloudflare-worker-release-evidence.v1" and .passed == true and .releaseTag == $tag and .deploymentTag == $workerTag and (.workerVersionId | length > 0) and (.smoke.currentDigests | length > 0) and .staleDigest.result.status == 403' \
+            "$evidence" >/dev/null
+          echo "Worker Version ID: $worker_version_id"
       - name: Generate the immutable release provenance record
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -2401,12 +3577,19 @@ jobs:
           EXPORT_MANIFEST_SHA256: ${{ steps.source.outputs.export_manifest_sha256 }}
           PUBLIC_PROVENANCE_SHA256: ${{ steps.source.outputs.public_provenance_sha256 }}
           DEPLOYMENT_SNAPSHOT_COMMIT: ${{ steps.deployment.outputs.merge_sha }}
+          CLOUDFLARE_WORKER_VERSION_ID: ${{ steps.cloudflare_worker.outputs.worker_version_id }}
         run: |
           set -euo pipefail
           manifest_digest="sha256:$(sha256sum dist/final/release.manifest.yaml | awk '{print $1}')"
           runtime_composition_digest="$(jq -er '.compositionDigest' dist/final/runtime-composition.json)"
           runtime_composition_asset_sha256="sha256:$(sha256sum dist/final/runtime-composition.json | awk '{print $1}')"
           component_evidence_asset_sha256="sha256:$(sha256sum dist/final/component-evidence.json | awk '{print $1}')"
+          cloudflare_worker_evidence_asset_sha256="sha256:$(sha256sum dist/final/cloudflare-worker-release-evidence.json | awk '{print $1}')"
+          cloudflare_worker_policy_sha256="$(jq -er '.policySha256' dist/final/cloudflare-worker-release-evidence.json)"
+          cloudflare_worker_source_sha256="$(jq -er '.workerSourceSha256' dist/final/cloudflare-worker-release-evidence.json)"
+          cloudflare_worker_deployment_tag="$(jq -er '.deploymentTag' dist/final/cloudflare-worker-release-evidence.json)"
+          cloudflare_worker_host="$(jq -er '.registryHost' dist/final/cloudflare-worker-release-evidence.json)"
+          test "$CLOUDFLARE_WORKER_VERSION_ID" = "$(jq -er '.workerVersionId' dist/final/cloudflare-worker-release-evidence.json)"
           jq -n \
             --arg artifactDigest "$manifest_digest" \
             --arg runtimeCompositionDigest "$runtime_composition_digest" \
@@ -2420,7 +3603,13 @@ jobs:
             --arg releaseTag "$RELEASE_TAG" \
             --arg publicSourceCommit "$GITHUB_SHA" \
             --arg deploymentSnapshotCommit "$DEPLOYMENT_SNAPSHOT_COMMIT" \
-            '{schemaVersion:1,status:"published",releaseTag:$releaseTag,artifactDigest:$artifactDigest,runtimeComposition:{asset:"runtime-composition.json",digest:$runtimeCompositionDigest,assetSha256:$runtimeCompositionAssetSha256},componentEvidence:{asset:"component-evidence.json",assetSha256:$componentEvidenceAssetSha256},privateSourceRevision:$privateSourceRevision,publicSourceCommit:$publicSourceCommit,deploymentSnapshotCommit:$deploymentSnapshotCommit,workflowIdentity:$workflowIdentity,builderRun:$builderRun,exportManifest:$exportManifest,publicProvenance:$publicProvenance,sbom:true,scanEvidence:{runtimeImages:true,engineHandoff:true,signatures:true}}' \
+            --arg cloudflareWorkerEvidenceAssetSha256 "$cloudflare_worker_evidence_asset_sha256" \
+            --arg cloudflareWorkerVersionId "$CLOUDFLARE_WORKER_VERSION_ID" \
+            --arg cloudflareWorkerDeploymentTag "$cloudflare_worker_deployment_tag" \
+            --arg cloudflareWorkerPolicySha256 "$cloudflare_worker_policy_sha256" \
+            --arg cloudflareWorkerSourceSha256 "$cloudflare_worker_source_sha256" \
+            --arg cloudflareWorkerHost "$cloudflare_worker_host" \
+            '{schemaVersion:1,status:"published",releaseTag:$releaseTag,artifactDigest:$artifactDigest,runtimeComposition:{asset:"runtime-composition.json",digest:$runtimeCompositionDigest,assetSha256:$runtimeCompositionAssetSha256},componentEvidence:{asset:"component-evidence.json",assetSha256:$componentEvidenceAssetSha256},cloudflareWorker:{asset:"cloudflare-worker-release-evidence.json",assetSha256:$cloudflareWorkerEvidenceAssetSha256,versionId:$cloudflareWorkerVersionId,deploymentTag:$cloudflareWorkerDeploymentTag,policySha256:$cloudflareWorkerPolicySha256,sourceSha256:$cloudflareWorkerSourceSha256,registryHost:$cloudflareWorkerHost},privateSourceRevision:$privateSourceRevision,publicSourceCommit:$publicSourceCommit,deploymentSnapshotCommit:$deploymentSnapshotCommit,workflowIdentity:$workflowIdentity,builderRun:$builderRun,exportManifest:$exportManifest,publicProvenance:$publicProvenance,sbom:true,scanEvidence:{runtimeImages:true,engineHandoff:true,signatures:true,cloudflareWorker:true}}' \
             > dist/final/public-release-provenance.json
       - name: Verify the complete release evidence closure
         env:
@@ -2433,6 +3622,7 @@ jobs:
             --composition dist/final/runtime-composition.json \
             --bundle dist/final/component-evidence.json \
             --provenance dist/final/public-release-provenance.json \
+            --cloudflare-worker-evidence dist/final/cloudflare-worker-release-evidence.json \
             --tag "$RELEASE_TAG" --release-profile "$RELEASE_PROFILE" --json \
             | tee dist/final/public-release-evidence-verification.json
       - name: Generate and publish the release-channel branch
@@ -2461,10 +3651,21 @@ jobs:
           fi
           if [ -d "$channel_worktree/channels" ]; then cp -a "$channel_worktree/channels/." "$channel_root/channels/"; fi
           if [ -d "$channel_worktree/manifests" ]; then cp -a "$channel_worktree/manifests/." "$channel_root/manifests/"; fi
+          preheat_args=()
+          deployment_asset_args=()
+          if [ "$RELEASE_PROFILE" != "alpha164-bridge" ] && [ "$RELEASE_TAG" != "v0.0.1-alpha.57" ]; then
+            preheat_args+=(--preheat-manifest dist/final/deployment-snapshot/preheat-manifest.json)
+            deployment_asset_args+=(
+              --compose dist/final/deployment-snapshot/compose.yaml
+              --third-party-policy dist/final/deployment-snapshot/third-party-image-policy.json
+            )
+          fi
           node scripts/ci/generate-public-channel.mjs \
             --tag "$RELEASE_TAG" --channel "$channel" --manifest dist/final/release.manifest.yaml \
             --runtime-composition dist/final/runtime-composition.json \
             --release-profile "$RELEASE_PROFILE" \
+            "${preheat_args[@]}" \
+            "${deployment_asset_args[@]}" \
             --output-dir "$channel_root" --publication-complete
           # The first successful publication can follow the frozen source
           # first tag, so do not manufacture a historical channel record.
@@ -2484,6 +3685,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          RELEASE_PROFILE: ${{ steps.release_profile.outputs.profile }}
           DEPLOYMENT_SNAPSHOT_COMMIT: ${{ steps.deployment.outputs.merge_sha }}
         run: |
           set -euo pipefail
@@ -2559,7 +3761,11 @@ jobs:
           }
           publish_asset dist/final/release.manifest.yaml
           publish_asset dist/final/runtime-composition.json
+          if [ "$RELEASE_PROFILE" != "alpha164-bridge" ] && [ "$RELEASE_TAG" != "v0.0.1-alpha.57" ]; then
+            publish_asset dist/final/deployment-snapshot/preheat-manifest.json
+          fi
           publish_asset dist/final/component-evidence.json
+          publish_asset dist/final/cloudflare-worker-release-evidence.json
           publish_asset dist/final/public-release-provenance.json
           publish_asset "dist/final/deployment/lunafox-${RELEASE_TAG}.zip"
           publish_asset dist/final/deployment-packages.json
@@ -2570,6 +3776,7 @@ jobs:
           path: |
             dist/final/release.manifest.yaml
             dist/final/runtime-composition.json
+            dist/final/deployment-snapshot/preheat-manifest.json
             dist/final/runtime-composition.core.json
             dist/final/runtime-composition-finalization.json
             dist/final/runtime-composition-binding.json
@@ -2577,6 +3784,9 @@ jobs:
             dist/final/component-evidence.json
             dist/final/component-evidence-build.json
             dist/final/component-evidence-verification.json
+            dist/final/cloudflare-worker-release-evidence.json
+            dist/final/cloudflare-worker-release-verification.json
+            dist/final/cloudflare-worker-versions.json
             dist/final/composition-plan/**
             dist/final/public-release-provenance.json
             dist/final/release-verification.json

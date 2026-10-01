@@ -41,7 +41,7 @@ done
 
 # Keep this list explicit. A public Runtime image is reproducible only when
 # its source and local module replacements are present in the projection.
-required_dirs=(frontend server server/scripts contracts engine-go proto extensions/engines extensions/workflows docker/nginx docker/bootstrap tools/engine-release tools/engine-oci-publish)
+required_dirs=(frontend server server/scripts contracts engine-go proto extensions/engines extensions/workflows docker/nginx docker/bootstrap tools/engine-release tools/engine-oci-publish tools/lunafox-ghcr-registry)
 for directory in "${required_dirs[@]}"; do
 	[ -d "$ROOT_DIR/$directory" ] || fail "required public source directory is missing: $directory"
 done
@@ -79,6 +79,19 @@ required_files=(
 	tools/engine-release/go.sum
 	tools/engine-oci-publish/go.mod
 	tools/engine-oci-publish/go.sum
+	tools/lunafox-ghcr-registry/.gitignore
+	tools/lunafox-ghcr-registry/README.md
+	tools/lunafox-ghcr-registry/package.json
+	tools/lunafox-ghcr-registry/pnpm-lock.yaml
+	tools/lunafox-ghcr-registry/tsconfig.json
+	tools/lunafox-ghcr-registry/tsconfig.test.json
+	tools/lunafox-ghcr-registry/wrangler.jsonc
+	tools/lunafox-ghcr-registry/src/registry.ts
+	tools/lunafox-ghcr-registry/src/worker.ts
+	tools/lunafox-ghcr-registry/test/worker.test.ts
+	tools/lunafox-ghcr-registry/scripts/verify-local-registry.sh
+	scripts/ci/verify-cloudflare-worker-release.mjs
+	scripts/ci/verify-cloudflare-worker-release.test.mjs
 )
 for file in "${required_files[@]}"; do
 	[ -f "$ROOT_DIR/$file" ] || fail "required public Runtime input is missing: $file"
@@ -123,6 +136,8 @@ if [ -e "$ROOT_DIR/agent" ]; then
 		lunafox-agent-linux-arm64
 		lunafox-engine-mount-preflight-linux-amd64
 		lunafox-engine-mount-preflight-linux-arm64
+		lunafox-engine-preheater-linux-amd64
+		lunafox-engine-preheater-linux-arm64
 		agent-bundle.json
 		agent-bundle.sha256
 		agent-bundle.sigstore.json
@@ -142,7 +157,7 @@ if [ -e "$ROOT_DIR/agent" ]; then
 		fi
 	done
 	jq -e --arg artifact_id "$agent_artifact_id" '
-		.schemaVersion == "lunafox.agent-bundle.v2" and
+		.schemaVersion == "lunafox.agent-bundle.v3" and
 		.artifactId == $artifact_id and
 		(.inputFingerprint | type == "object" and .version == 1 and .algorithm == "sha256-canonical-json-v1" and (.value | test("^sha256:[a-f0-9]{64}$"))) and
 		("sha256-" + (.inputFingerprint.value | ltrimstr("sha256:"))) == $artifact_id and
@@ -155,7 +170,7 @@ if [ -e "$ROOT_DIR/tools" ]; then
 	for tool_path in "$ROOT_DIR/tools"/*; do
 		[ -e "$tool_path" ] || continue
 		case "$(basename "$tool_path")" in
-		engine-release | engine-oci-publish) ;;
+		engine-release | engine-oci-publish | lunafox-ghcr-registry) ;;
 		*) fail "private or development tool is present in public Runtime tree: ${tool_path#"$ROOT_DIR"/}" ;;
 		esac
 	done
@@ -184,7 +199,7 @@ for document in CONTRIBUTING.md docs/public-deployment.md NOTICE-CLOSED-ARTIFACT
 done
 
 if [ "$JSON_OUTPUT" -eq 1 ]; then
-	printf '%s\n' '{"schemaVersion":1,"passed":true,"sourceClosure":"frontend,server,contracts,engine-go,proto,extensions,nginx,bootstrap,engine-release-tools","secretless":true}'
+	printf '%s\n' '{"schemaVersion":1,"passed":true,"sourceClosure":"frontend,server,contracts,engine-go,proto,extensions,nginx,bootstrap,engine-release-tools,cloudflare-registry-worker","secretless":true}'
 else
 	echo "public Runtime source closure verified (secretless)"
 fi

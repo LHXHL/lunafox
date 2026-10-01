@@ -26,10 +26,24 @@
     },
     {
       "id": "000004",
+      "slug": "upgrade_operation_host_activity",
+      "up": "000004_upgrade_operation_host_activity.up.sql",
+      "down": "000004_upgrade_operation_host_activity.down.sql",
+      "checksum": "sha256:940a3cefb86090ec0999fc381f7d51e3b3cea37ee87c0c67adc4afbac128d34b"
+    },
+    {
+      "id": "000005",
+      "slug": "scheduled_scan_handoff_retry",
+      "up": "000005_scheduled_scan_handoff_retry.up.sql",
+      "down": "000005_scheduled_scan_handoff_retry.down.sql",
+      "checksum": "sha256:e1237440f43ddc28cac2ed077ce163fa9acae541502af37d19f776b0b7dcbc3c"
+    },
+    {
+      "id": "000006",
       "slug": "auth_finding_snapshot",
-      "up": "000004_auth_finding_snapshot.up.sql",
-      "down": "000004_auth_finding_snapshot.down.sql",
-      "checksum": "sha256:af6113020e2ff247d233a122a653572a32b4a514b19b999341b49c3fea6002b3"
+      "up": "000006_auth_finding_snapshot.up.sql",
+      "down": "000006_auth_finding_snapshot.down.sql",
+      "checksum": "sha256:b5cb58106962ddb6739df294f2de31cf0c9c45ce329864920f0e0f3142c2e3ef"
     }
   ]
 }
