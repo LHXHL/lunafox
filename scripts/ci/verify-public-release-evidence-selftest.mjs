@@ -34,6 +34,21 @@ validateReleaseProvenance(valid, facts);
 const retiredWorkerBinding = structuredClone(valid);
 retiredWorkerBinding.cloudflareWorker = { asset: "cloudflare-worker-release-evidence.json" };
 assert.throws(() => validateReleaseProvenance(retiredWorkerBinding, facts), /unexpected field set/);
+// Historical assets published before the worker removal keep the retired
+// binding; reading them for reuse tolerates it, new publications do not.
+validateReleaseProvenance(retiredWorkerBinding, facts, { allowRetiredWorkerBinding: true });
+retiredWorkerBinding.scanEvidence.cloudflareWorker = true;
+const scanOnlyRetired = structuredClone(valid);
+scanOnlyRetired.scanEvidence.cloudflareWorker = true;
+assert.throws(() => validateReleaseProvenance(scanOnlyRetired, facts), /scanEvidence has an unexpected field set/);
+validateReleaseProvenance(retiredWorkerBinding, facts, { allowRetiredWorkerBinding: true });
+const badRetiredScan = structuredClone(retiredWorkerBinding);
+badRetiredScan.scanEvidence.cloudflareWorker = false;
+assert.throws(() => validateReleaseProvenance(badRetiredScan, facts, { allowRetiredWorkerBinding: true }), /cloudflareWorker is invalid/);
+assert.doesNotThrow(() => validateReleaseProvenance(valid, facts, { allowRetiredWorkerBinding: true }));
+const malformedRetired = structuredClone(valid);
+malformedRetired.cloudflareWorker = "not-an-object";
+assert.throws(() => validateReleaseProvenance(malformedRetired, facts, { allowRetiredWorkerBinding: true }), /cloudflareWorker binding is invalid/);
 const swappedComposition = structuredClone(valid);
 swappedComposition.runtimeComposition.assetSha256 = digest("4");
 assert.throws(() => validateReleaseProvenance(swappedComposition, facts), /composition asset digest does not match bytes/);
